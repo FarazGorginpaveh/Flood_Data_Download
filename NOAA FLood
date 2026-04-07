@@ -1,0 +1,104 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Apr  6 20:27:54 2026
+
+@author: Faraz Gorginpaveh
+"""
+import os
+import re
+import requests
+import gzip
+import shutil
+from bs4 import BeautifulSoup
+
+# =========================
+# SETTINGS
+# =========================
+download_folder = r"D:\Flood_Data\gz_files"
+extract_folder = r"D:\Flood_Data\csv_files"
+
+start_year = 1996
+end_year = 2025
+
+base_url = "https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/"
+
+os.makedirs(download_folder, exist_ok=True)
+os.makedirs(extract_folder, exist_ok=True)
+
+# =========================
+# READ DIRECTORY PAGE
+# =========================
+print("Reading NOAA directory...")
+resp = requests.get(base_url, timeout=60)
+resp.raise_for_status()
+
+html = resp.text
+soup = BeautifulSoup(html, "html.parser")
+
+all_links = [a.get("href") for a in soup.find_all("a") if a.get("href")]
+
+# Keep only detail files
+detail_files = [
+    link for link in all_links
+    if re.match(r"StormEvents_details-ftp_v1\.0_d\d{4}_c\d{8}\.csv\.gz", link)
+]
+
+print(f"Found {len(detail_files)} detail files.")
+
+# =========================
+# DOWNLOAD + EXTRACT
+# =========================
+for year in range(start_year, end_year + 1):
+    pattern = rf"StormEvents_details-ftp_v1\.0_d{year}_c\d{{8}}\.csv\.gz"
+    matches = [f for f in detail_files if re.fullmatch(pattern, f)]
+
+    if not matches:
+        print(f"\nNo matching file found for year {year}")
+        continue
+
+    filename = matches[0]
+    file_url = base_url + filename
+
+    gz_path = os.path.join(download_folder, filename)
+    csv_name = filename[:-3]   # remove .gz
+    csv_path = os.path.join(extract_folder, csv_name)
+
+    print(f"\nProcessing year {year}...")
+
+    # Download
+    if not os.path.exists(gz_path):
+        try:
+            print(f"Downloading: {filename}")
+            response = requests.get(file_url, stream=True, timeout=120)
+            response.raise_for_status()
+
+            with open(gz_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            print(f"Downloaded: {gz_path}")
+
+        except Exception as e:
+            print(f"Failed to download {year}: {e}")
+            continue
+    else:
+        print(f"Already downloaded: {gz_path}")
+
+    # Extract
+    if not os.path.exists(csv_path):
+        try:
+            print(f"Extracting: {csv_name}")
+            with gzip.open(gz_path, "rb") as f_in:
+                with open(csv_path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+
+            print(f"Extracted: {csv_path}")
+
+        except Exception as e:
+            print(f"Failed to extract {year}: {e}")
+            continue
+    else:
+        print(f"Already extracted: {csv_path}")
+
+print("\nAll done.")

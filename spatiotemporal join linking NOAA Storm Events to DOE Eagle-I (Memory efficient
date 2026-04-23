@@ -1,0 +1,366 @@
+"""
+=============================================================================
+  NOAA Storm Events × Eagle-I Power Outage Joiner  (memory-safe v2)
+=============================================================================
+  Fix: the naive merge exploded to ~26 GB because every outage row was
+  paired with every storm row sharing the same FIPS before the time filter
+  ran.  This version iterates county-by-county so the working set at any
+  moment is tiny.
+
+  Strategy
+  --------
+  1. Group Eagle-I outages by fips_code  → dict {fips: DataFrame}
+  2. Group Storm events  by fips5        → dict {fips: DataFrame}
+  3. For each FIPS that appears in BOTH:
+       a. Expand storm windows by ±buffer
+       b. Do a small merge (maybe 10 storms × 35 040 outage snapshots)
+       c. Append matches to a list of small DataFrames
+  4. pd.concat() once at the end  → write to CSV
+
+  Peak RAM usage ≈ max(outages for one county) × max(storms for one county)
+  which is orders of magnitude smaller than the full cross product.
+
+=============================================================================
+"""
+
+import gc
+import os
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+STORM_CSV   = r"D:\Flood_Data\Clean\StormEvents_details-ftp_v1.0_d2025_c20260323_clean.csv"
+OUTAGE_CSV  = r"D:\Project_3\Power_Try1\eaglei_outages_2025.csv"
+OUTPUT_DIR  = r"D:\Project_3\Joined_Output"
+
+BUFFERS_HOURS = [0, 6, 24, 48, 72]   # 0 = exact overlap only
+
+CZ_TYPE_KEEP      = ["C"]            # county-level events only
+EAGLEI_INTERVAL   = 15               # minutes between Eagle-I snapshots
+
+# Columns to carry forward from storm events into the output
+STORM_COLS = [
+    "event_id", "episode_id", "event_type", "state", "county",
+    "fips5", "start_time", "end_time", "event_duration_hrs",
+    "damage_total_usd", "damage_property_usd", "damage_crops_usd",
+    "deaths_direct", "deaths_indirect",
+    "injuries_direct", "injuries_indirect",
+    "magnitude", "magnitude_type", "flood_cause",
+    "episode_narrative", "event_narrative",
+]
+
+# Storm columns that clash with Eagle-I column names → rename with storm_ prefix
+# Eagle-I has: fips_code, county, state, customers_out, run_start_time
+STORM_RENAME = {
+    "state":  "storm_state",
+    "county": "storm_county",
+}
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+log_lines = []
+
+def log(msg: str = ""):
+    print(msg)
+    log_lines.append(msg)
+
+# =============================================================================
+# LOAD STORM EVENTS
+# =============================================================================
+
+def load_storm_events(path: str) -> pd.DataFrame:
+    log("=" * 70)
+    log("LOADING STORM EVENTS")
+    log("=" * 70)
+
+    df = pd.read_csv(path, low_memory=False)
+    log(f"  Raw rows            : {len(df):,}")
+
+    # Keep county-type only
+    df = df[df["cz_type"].isin(CZ_TYPE_KEEP)].copy()
+    log(f"  After cz_type filter: {len(df):,}")
+
+    # Parse times
+    df["start_time"] = pd.to_datetime(df["start_time"], errors="coerce")
+    df["end_time"]   = pd.to_datetime(df["end_time"],   errors="coerce")
+    bad = df["start_time"].isna() | df["end_time"].isna()
+    if bad.sum():
+        log(f"  Dropping {bad.sum()} rows with bad timestamps")
+        df = df[~bad]
+
+    # 5-digit FIPS
+    df["state_fips"]  = df["state_fips"].astype(str).str.zfill(2)
+    df["county_fips"] = df["county_fips"].astype(str).str.zfill(3)
+    df["fips5"]       = (df["state_fips"] + df["county_fips"]).astype(int)
+
+    df["event_duration_hrs"] = (
+        (df["end_time"] - df["start_time"]).dt.total_seconds() / 3600
+    ).round(2)
+
+    # Numeric damage columns — fill NaN with 0
+    for col in ["damage_total_usd", "damage_property_usd", "damage_crops_usd"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    log(f"  Final storm rows    : {len(df):,}")
+    log(f"  Event types         : {sorted(df['event_type'].unique().tolist())}")
+    log(f"  Date range          : {df['start_time'].min()} → {df['end_time'].max()}")
+    log(f"  Unique counties     : {df['fips5'].nunique():,}")
+    log()
+    return df
+
+# =============================================================================
+# LOAD EAGLE-I OUTAGES
+# =============================================================================
+
+def load_outages(path: str) -> pd.DataFrame:
+    log("=" * 70)
+    log("LOADING EAGLE-I OUTAGES")
+    log("=" * 70)
+
+    df = pd.read_csv(path, low_memory=False)
+    log(f"  Raw rows            : {len(df):,}")
+
+    df["run_start_time"] = pd.to_datetime(df["run_start_time"], errors="coerce")
+    bad = df["run_start_time"].isna()
+    if bad.sum():
+        log(f"  Dropping {bad.sum()} rows with bad timestamps")
+        df = df[~bad]
+
+    df["fips_code"] = pd.to_numeric(df["fips_code"], errors="coerce")
+    df = df.dropna(subset=["fips_code"])
+    df["fips_code"] = df["fips_code"].astype(int)
+
+    # Keep only rows with actual outages
+    df = df[df["customers_out"] > 0].copy()
+    log(f"  After zero-drop     : {len(df):,}")
+    log(f"  Date range          : {df['run_start_time'].min()} → {df['run_start_time'].max()}")
+    log(f"  Unique counties     : {df['fips_code'].nunique():,}")
+    log()
+    return df
+
+# =============================================================================
+# COUNTY-BY-COUNTY JOIN  (memory safe)
+# =============================================================================
+
+def join_county_by_county(
+    storms_by_fips: dict,
+    outages_by_fips: dict,
+    buffer_hours: int,
+) -> pd.DataFrame:
+    """
+    Iterate over every FIPS that has both storm events and outage records.
+    For each county, expand storm windows, merge with outage snapshots, and
+    filter by time overlap.  Collect tiny result frames then concat once.
+    """
+    buf = pd.Timedelta(hours=buffer_hours)
+
+    # Only counties that appear in both datasets
+    common_fips = sorted(set(storms_by_fips.keys()) & set(outages_by_fips.keys()))
+    log(f"    Counties in both datasets : {len(common_fips):,}")
+
+    chunks = []
+    for fips in common_fips:
+        s = storms_by_fips[fips].copy()
+        o = outages_by_fips[fips].copy()
+
+        # Expand storm windows
+        s["_win_start"] = s["start_time"] - buf
+        s["_win_end"]   = s["end_time"]   + buf
+
+        # Rename clashing storm columns BEFORE the cross-join so pandas never
+        # sees duplicate names (Eagle-I also has 'state' and 'county')
+        s = s.rename(columns=STORM_RENAME)
+        storm_cols_renamed = [STORM_RENAME.get(c, c) for c in STORM_COLS]
+
+        # Cross-join this county's storms × outages (small!)
+        s["_key"] = 1
+        o["_key"] = 1
+        cross = o.merge(s[storm_cols_renamed + ["_win_start", "_win_end", "_key"]],
+                        on="_key").drop(columns=["_key"])
+
+        # Time filter
+        mask = (
+            (cross["run_start_time"] >= cross["_win_start"]) &
+            (cross["run_start_time"] <= cross["_win_end"])
+        )
+        matched = cross[mask].drop(columns=["_win_start", "_win_end"])
+
+        if len(matched):
+            # Offset metrics
+            matched["offset_to_start_hrs"] = (
+                (matched["run_start_time"] - matched["start_time"])
+                .dt.total_seconds() / 3600
+            ).round(2)
+            matched["offset_to_end_hrs"] = (
+                (matched["run_start_time"] - matched["end_time"])
+                .dt.total_seconds() / 3600
+            ).round(2)
+            matched["within_event_window"] = (
+                (matched["run_start_time"] >= matched["start_time"]) &
+                (matched["run_start_time"] <= matched["end_time"])
+            )
+            matched["buffer_hours_used"] = buffer_hours
+            chunks.append(matched)
+
+    if not chunks:
+        return pd.DataFrame()
+
+    result = pd.concat(chunks, ignore_index=True)
+    return result
+
+# =============================================================================
+# SUMMARY TABLES
+# =============================================================================
+
+def summarize_by_event_type(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby("event_type")
+        .agg(
+            n_storm_events      = ("event_id",        "nunique"),
+            n_outage_snapshots  = ("run_start_time",  "count"),
+            n_counties_affected = ("fips_code",       "nunique"),
+            total_customers_out = ("customers_out",   "sum"),
+            peak_customers_out  = ("customers_out",   "max"),
+            mean_customers_out  = ("customers_out",   "mean"),
+            total_damage_usd    = ("damage_total_usd","sum"),
+            total_deaths_direct = ("deaths_direct",   "sum"),
+            total_injuries      = ("injuries_direct", "sum"),
+        )
+        .reset_index()
+        .sort_values("total_customers_out", ascending=False)
+    )
+
+def summarize_by_event(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby(["event_id", "event_type", "storm_state", "storm_county",
+                    "start_time", "end_time", "event_duration_hrs",
+                    "damage_total_usd", "deaths_direct"])
+        .agg(
+            n_outage_snapshots  = ("run_start_time", "count"),
+            total_customers_out = ("customers_out",  "sum"),
+            peak_customers_out  = ("customers_out",  "max"),
+            mean_customers_out  = ("customers_out",  "mean"),
+        )
+        .reset_index()
+        .sort_values("total_customers_out", ascending=False)
+    )
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    t0 = time.time()
+    out_dir = Path(OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    log("=" * 70)
+    log("  NOAA STORM EVENTS × EAGLE-I OUTAGE JOINER  (memory-safe v2)")
+    log(f"  Run time : {pd.Timestamp.now()}")
+    log("=" * 70)
+    log()
+
+    # ── Load ──────────────────────────────────────────────────────────────────
+    storms  = load_storm_events(STORM_CSV)
+    outages = load_outages(OUTAGE_CSV)
+
+    # ── Pre-group by FIPS (do this ONCE, reuse for all buffers) ──────────────
+    log("Pre-grouping data by county FIPS ...")
+    storms_by_fips  = {fips: grp for fips, grp in storms.groupby("fips5")}
+    outages_by_fips = {fips: grp for fips, grp in outages.groupby("fips_code")}
+    log(f"  Storm counties  : {len(storms_by_fips):,}")
+    log(f"  Outage counties : {len(outages_by_fips):,}")
+    log()
+
+    buffer_labels = {0: "exact", 6: "6h", 24: "24h", 48: "48h", 72: "72h"}
+    results_summary = []
+
+    # ── Process each buffer ───────────────────────────────────────────────────
+    for buf in BUFFERS_HOURS:
+        label = buffer_labels[buf]
+        log("=" * 70)
+        log(f"JOINING  |  buffer = ±{buf}h  ({label})")
+        log("=" * 70)
+
+        matched = join_county_by_county(storms_by_fips, outages_by_fips, buf)
+
+        if matched.empty:
+            log("  No matches found.")
+            results_summary.append((label, 0, 0, 0, 0))
+            continue
+
+        n_rows    = len(matched)
+        n_events  = matched["event_id"].nunique()
+        n_counties= matched["fips_code"].nunique()
+        total_out = matched["customers_out"].sum()
+
+        log(f"  Matched snapshots        : {n_rows:,}")
+        log(f"  Unique storm events      : {n_events:,}")
+        log(f"  Counties affected        : {n_counties:,}")
+        log(f"  Total customers_out sum  : {total_out:,.0f}")
+
+        # Save full matched file
+        out_file = out_dir / f"matched_outages_{label}.csv"
+        matched.to_csv(out_file, index=False)
+        log(f"  Saved → {out_file}")
+
+        # Summaries
+        st = summarize_by_event_type(matched)
+        se = summarize_by_event(matched)
+        st.to_csv(out_dir / f"summary_by_event_type_{label}.csv", index=False)
+        se.to_csv(out_dir / f"summary_by_event_{label}.csv",      index=False)
+        log(f"  Saved → summary_by_event_type_{label}.csv")
+        log(f"  Saved → summary_by_event_{label}.csv")
+
+        # Print top event types
+        log(f"\n  TOP EVENT TYPES (buffer={label}):")
+        log(f"  {'Event Type':<35} {'Events':>7} {'Snapshots':>10} "
+            f"{'Cust-Out':>12} {'Peak':>10}")
+        log(f"  {'-'*35} {'-'*7} {'-'*10} {'-'*12} {'-'*10}")
+        for _, r in st.head(15).iterrows():
+            log(f"  {r['event_type']:<35} {int(r['n_storm_events']):>7,} "
+                f"{int(r['n_outage_snapshots']):>10,} "
+                f"{r['total_customers_out']:>12,.0f} "
+                f"{r['peak_customers_out']:>10,.0f}")
+        log()
+
+        results_summary.append((label, n_rows, n_events, n_counties, total_out))
+
+        # Free memory before next buffer
+        del matched
+        gc.collect()
+
+    # ── Cross-buffer comparison ───────────────────────────────────────────────
+    log("=" * 70)
+    log("BUFFER COMPARISON SUMMARY")
+    log("=" * 70)
+    log(f"  {'Buffer':<8} {'Rows':>12} {'Events':>10} "
+        f"{'Counties':>10} {'Cust-Out Total':>16}")
+    log(f"  {'-'*8} {'-'*12} {'-'*10} {'-'*10} {'-'*16}")
+    for label, rows, evts, cnts, cout in results_summary:
+        log(f"  {label:<8} {rows:>12,} {evts:>10,} {cnts:>10,} {cout:>16,.0f}")
+    log()
+
+    elapsed = time.time() - t0
+    log(f"Completed in {elapsed:.1f} seconds.")
+
+    log_path = out_dir / "join_report.txt"
+    with open(log_path, "w") as f:
+        f.write("\n".join(log_lines))
+    print(f"\nLog saved → {log_path}")
+
+
+if __name__ == "__main__":
+    main()

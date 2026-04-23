@@ -1,0 +1,231 @@
+import os
+import glob
+import pandas as pd
+import numpy as np
+
+# =========================================================
+# Paths
+# =========================================================
+input_folder = r"D:\Flood_Data\csv_files"
+output_folder = r"D:\Flood_Data\Clean"
+
+os.makedirs(output_folder, exist_ok=True)
+
+# =========================================================
+# Damage cleaner
+# =========================================================
+def clean_damage(value):
+    if pd.isna(value):
+        return 0.0
+
+    value = str(value).strip().replace(",", "")
+
+    if value == "":
+        return 0.0
+
+    multiplier = 1.0
+
+    if value.endswith("K"):
+        multiplier = 1e3
+        value = value[:-1]
+    elif value.endswith("M"):
+        multiplier = 1e6
+        value = value[:-1]
+    elif value.endswith("B"):
+        multiplier = 1e9
+        value = value[:-1]
+
+    try:
+        return float(value) * multiplier
+    except:
+        return 0.0
+
+# =========================================================
+# Find all NOAA detail files
+# =========================================================
+pattern = os.path.join(input_folder, "StormEvents_details-ftp_v1.0_d*_c*.csv")
+files = sorted(glob.glob(pattern))
+
+print(f"Found {len(files)} files.\n")
+
+# =========================================================
+# Process each file
+# =========================================================
+for i, input_file in enumerate(files, start=1):
+    print("=" * 80)
+    print(f"[{i}/{len(files)}] Processing:")
+    print(input_file)
+
+    try:
+        # Read file
+        df = pd.read_csv(input_file, low_memory=False)
+
+        # -------------------------------------------------
+        # Datetime
+        # -------------------------------------------------
+        df["start_time"] = pd.to_datetime(df["BEGIN_DATE_TIME"], errors="coerce")
+        df["end_time"] = pd.to_datetime(df["END_DATE_TIME"], errors="coerce")
+
+        df["duration_min"] = (df["end_time"] - df["start_time"]).dt.total_seconds() / 60
+        df.loc[df["duration_min"] < 0, "duration_min"] = np.nan
+
+        # -------------------------------------------------
+        # Damage
+        # -------------------------------------------------
+        df["damage_property_usd"] = df["DAMAGE_PROPERTY"].apply(clean_damage)
+        df["damage_crops_usd"] = df["DAMAGE_CROPS"].apply(clean_damage)
+        df["damage_total_usd"] = df["damage_property_usd"] + df["damage_crops_usd"]
+
+        # -------------------------------------------------
+        # Coordinates
+        # -------------------------------------------------
+        df["lat"] = pd.to_numeric(df["BEGIN_LAT"], errors="coerce")
+        df["lon"] = pd.to_numeric(df["BEGIN_LON"], errors="coerce")
+        df["end_lat"] = pd.to_numeric(df["END_LAT"], errors="coerce")
+        df["end_lon"] = pd.to_numeric(df["END_LON"], errors="coerce")
+
+        # -------------------------------------------------
+        # Clean state/county text
+        # -------------------------------------------------
+        df["state"] = df["STATE"].astype(str).str.strip()
+        df["county"] = df["CZ_NAME"].astype(str).str.strip()
+
+        # -------------------------------------------------
+        # Keep useful columns only
+        # -------------------------------------------------
+        keep_columns = [
+            "EVENT_ID",
+            "EPISODE_ID",
+            "EVENT_TYPE",
+            "start_time",
+            "end_time",
+            "duration_min",
+            "YEAR",
+            "MONTH_NAME",
+            "state",
+            "county",
+            "CZ_TYPE",
+            "CZ_FIPS",
+            "STATE_FIPS",
+            "lat",
+            "lon",
+            "end_lat",
+            "end_lon",
+            "INJURIES_DIRECT",
+            "INJURIES_INDIRECT",
+            "DEATHS_DIRECT",
+            "DEATHS_INDIRECT",
+            "damage_property_usd",
+            "damage_crops_usd",
+            "damage_total_usd",
+            "MAGNITUDE",
+            "MAGNITUDE_TYPE",
+            "FLOOD_CAUSE",
+            "CATEGORY",
+            "SOURCE",
+            "EPISODE_NARRATIVE",
+            "EVENT_NARRATIVE",
+            "DATA_SOURCE"
+        ]
+
+        keep_columns = [col for col in keep_columns if col in df.columns]
+        df_clean = df[keep_columns].copy()
+
+        # -------------------------------------------------
+        # Rename columns
+        # -------------------------------------------------
+        rename_dict = {
+            "EVENT_ID": "event_id",
+            "EPISODE_ID": "episode_id",
+            "EVENT_TYPE": "event_type",
+            "YEAR": "year",
+            "MONTH_NAME": "month_name",
+            "CZ_TYPE": "cz_type",
+            "CZ_FIPS": "county_fips",
+            "STATE_FIPS": "state_fips",
+            "INJURIES_DIRECT": "injuries_direct",
+            "INJURIES_INDIRECT": "injuries_indirect",
+            "DEATHS_DIRECT": "deaths_direct",
+            "DEATHS_INDIRECT": "deaths_indirect",
+            "MAGNITUDE": "magnitude",
+            "MAGNITUDE_TYPE": "magnitude_type",
+            "FLOOD_CAUSE": "flood_cause",
+            "CATEGORY": "category",
+            "SOURCE": "source",
+            "EPISODE_NARRATIVE": "episode_narrative",
+            "EVENT_NARRATIVE": "event_narrative",
+            "DATA_SOURCE": "data_source"
+        }
+
+        df_clean.rename(columns=rename_dict, inplace=True)
+
+        # -------------------------------------------------
+        # Add readable location
+        # -------------------------------------------------
+        if "county" in df_clean.columns and "state" in df_clean.columns:
+            df_clean["location"] = df_clean["county"].astype(str) + ", " + df_clean["state"].astype(str)
+
+        # -------------------------------------------------
+        # Final column order
+        # -------------------------------------------------
+        desired_order = [
+            "event_id",
+            "episode_id",
+            "event_type",
+            "start_time",
+            "end_time",
+            "duration_min",
+            "year",
+            "month_name",
+            "state",
+            "county",
+            "location",
+            "cz_type",
+            "state_fips",
+            "county_fips",
+            "lat",
+            "lon",
+            "end_lat",
+            "end_lon",
+            "injuries_direct",
+            "injuries_indirect",
+            "deaths_direct",
+            "deaths_indirect",
+            "damage_property_usd",
+            "damage_crops_usd",
+            "damage_total_usd",
+            "magnitude",
+            "magnitude_type",
+            "flood_cause",
+            "category",
+            "source",
+            "episode_narrative",
+            "event_narrative",
+            "data_source"
+        ]
+
+        final_columns = [col for col in desired_order if col in df_clean.columns]
+        df_clean = df_clean[final_columns]
+
+        # Sort
+        if "start_time" in df_clean.columns:
+            df_clean = df_clean.sort_values("start_time").reset_index(drop=True)
+
+        # -------------------------------------------------
+        # Output file name
+        # -------------------------------------------------
+        base_name = os.path.basename(input_file)
+        output_name = base_name.replace(".csv", "_clean.csv")
+        output_file = os.path.join(output_folder, output_name)
+
+        # Save
+        df_clean.to_csv(output_file, index=False)
+
+        print(f"[OK] Saved: {output_file}")
+        print(f"Rows: {len(df_clean):,} | Columns: {len(df_clean.columns)}")
+
+    except Exception as e:
+        print(f"[ERROR] Failed for file: {input_file}")
+        print("Reason:", e)
+
+print("\nDone.")

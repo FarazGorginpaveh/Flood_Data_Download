@@ -1,0 +1,316 @@
+"""
+Power Outage Event Detection — Eagle-I Data (All Years, 2014–2025)
+==================================================================
+Robust to column name variations across yearly files.
+Processes one CSV per year → one output CSV per year + combined file.
+
+Detection logic:
+  - Sparse → dense (zero-fill missing county/timestamp combos)
+  - Threshold = max(P90 over full-year dense series, 10)
+  - Event START : ≥ 4 consecutive 15-min steps above threshold (1 hour)
+  - Event END   : ≥ 12 consecutive 15-min steps below threshold (3 hours)
+  - Multi-peak  : dip < 12 steps below threshold keeps the event open
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+INPUT_DIR  = Path(r"D:\Project_3\Power_Try1")
+OUTPUT_DIR = Path(r"D:\Project_3\Joined_Output_4")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+INPUT_FILES = {
+    year: INPUT_DIR / f"eaglei_outages_{year}.csv"
+    for year in range(2014, 2026)
+}
+
+START_STEPS = 4
+END_STEPS   = 12
+P90_FLOOR   = 10
+
+# ── Possible column name variants across Eagle-I yearly files ──────────────────
+# Each entry is a list of candidates in priority order (lowercase, stripped).
+COL_CANDIDATES = {
+    "fips"        : ["fips_code", "fips", "county_fips", "countyfips"],
+    "county"      : ["county", "county_name", "countyname"],
+    "state"       : ["state", "state_name", "statename"],
+    "customers_out": [
+        "customers_out",
+        "customersout",
+        "customers_affected",
+        "customersaffected",
+        "outage_count",
+        "outages",
+        "count",
+    ],
+    "timestamp"   : [
+        "run_start_time",
+        "run_start",
+        "timestamp",
+        "datetime",
+        "date_time",
+        "date",
+        "time",
+        "snapshot_time",
+    ],
+}
+
+
+def resolve_columns(df: pd.DataFrame, year: int) -> dict[str, str]:
+    """
+    Match each logical column to the actual column name present in df.
+    Prints a diagnostic table so you can see exactly what was found.
+    Raises a clear error if a required column cannot be found.
+    """
+    cols_lower = {c.lower().strip(): c for c in df.columns}  # lower → original
+
+    print(f"\n  Column mapping for {year}:")
+    print(f"  {'Logical':<18} {'Found as':<30} {'Original dtype'}")
+    print(f"  {'-'*18} {'-'*30} {'-'*15}")
+
+    mapping = {}
+    for logical, candidates in COL_CANDIDATES.items():
+        found = None
+        for cand in candidates:
+            if cand in cols_lower:
+                found = cols_lower[cand]
+                break
+        if found is None:
+            # Last resort: fuzzy — any col containing the first candidate word
+            keyword = candidates[0].split("_")[0]
+            matches = [orig for low, orig in cols_lower.items() if keyword in low]
+            if matches:
+                found = matches[0]
+
+        dtype = str(df[found].dtype) if found else "NOT FOUND"
+        print(f"  {logical:<18} {str(found):<30} {dtype}")
+        mapping[logical] = found
+
+    missing = [k for k, v in mapping.items() if v is None]
+    if missing:
+        print(f"\n  Available columns in file: {list(df.columns)}")
+        raise KeyError(
+            f"Year {year}: could not find columns for: {missing}.\n"
+            f"  Available columns: {list(df.columns)}\n"
+            f"  Add the correct name to COL_CANDIDATES at the top of this script."
+        )
+    return mapping
+
+
+def load_year(path: Path, year: int) -> tuple[pd.DataFrame, dict]:
+    df = pd.read_csv(path, low_memory=False)
+    df.columns = df.columns.str.strip()  # strip whitespace, keep original case
+
+    mapping = resolve_columns(df, year)
+
+    # Rename to standard names
+    rename = {v: k for k, v in mapping.items() if v != k}
+    df.rename(columns=rename, inplace=True)
+
+    df["timestamp"]    = pd.to_datetime(df["timestamp"])
+    df["fips"]         = df["fips"].astype(str).str.zfill(5)
+    df["customers_out"] = pd.to_numeric(df["customers_out"], errors="coerce").fillna(0)
+
+    return df
+
+
+def build_dense_pivot(df: pd.DataFrame) -> pd.DataFrame:
+    t_min     = df["timestamp"].min().floor("15min")
+    t_max     = df["timestamp"].max().ceil("15min")
+    full_grid = pd.date_range(start=t_min, end=t_max, freq="15min")
+
+    agg = (
+        df.groupby(["fips", "timestamp"])["customers_out"]
+        .sum()
+        .reset_index()
+    )
+    pivot = (
+        agg.pivot(index="timestamp", columns="fips", values="customers_out")
+        .reindex(full_grid)
+        .fillna(0)
+        .astype(int)
+    )
+    return pivot
+
+
+def _summarise_event(fips, county, state, ev_times, ev_counts, threshold, p90):
+    return {
+        "fips_code"                  : fips,
+        "county"                     : county,
+        "state"                      : state,
+        "event_start"                : ev_times[0],
+        "event_end"                  : ev_times[-1],
+        "duration_min"               : int(
+            (ev_times[-1] - ev_times[0]).total_seconds() / 60
+        ),
+        "peak_customers_out"         : int(ev_counts.max()),
+        "mean_customers_out"         : round(float(ev_counts.mean()), 1),
+        "threshold"                  : round(float(threshold), 2),
+        "p90_customers_out"          : round(float(p90), 2),
+        "n_snapshots_above_threshold": int((ev_counts > threshold).sum()),
+    }
+
+
+def detect_events_dense(fips, series, threshold, p90, county, state) -> list:
+    times  = series.index
+    counts = series.values
+    above  = counts > threshold
+
+    events       = []
+    in_event     = False
+    ev_start_i   = None
+    below_streak = 0
+    pend_end_i   = None
+    pre_streak   = 0
+    cand_start   = None
+
+    for i in range(len(times)):
+        if not in_event:
+            if above[i]:
+                pre_streak += 1
+                if pre_streak == 1:
+                    cand_start = i
+                if pre_streak >= START_STEPS:
+                    in_event     = True
+                    ev_start_i   = cand_start
+                    below_streak = 0
+                    pend_end_i   = None
+            else:
+                pre_streak = 0
+                cand_start = None
+        else:
+            if above[i]:
+                below_streak = 0
+                pend_end_i   = None
+            else:
+                if below_streak == 0:
+                    pend_end_i = i
+                below_streak += 1
+                if below_streak >= END_STEPS:
+                    ev_counts = counts[ev_start_i:pend_end_i]
+                    ev_times  = times[ev_start_i:pend_end_i]
+                    if len(ev_times):
+                        events.append(_summarise_event(
+                            fips, county, state, ev_times, ev_counts,
+                            threshold, p90
+                        ))
+                    in_event     = False
+                    ev_start_i   = None
+                    below_streak = 0
+                    pend_end_i   = None
+                    pre_streak   = 0
+                    cand_start   = None
+
+    if in_event and ev_start_i is not None:
+        end_i     = pend_end_i if pend_end_i is not None else len(times)
+        ev_counts = counts[ev_start_i:end_i]
+        ev_times  = times[ev_start_i:end_i]
+        if len(ev_times):
+            events.append(_summarise_event(
+                fips, county, state, ev_times, ev_counts, threshold, p90
+            ))
+    return events
+
+
+def process_year(year: int, path: Path) -> pd.DataFrame | None:
+    print(f"\n{'='*60}")
+    print(f"  Processing {year}  →  {path.name}")
+    print(f"{'='*60}")
+
+    if not path.exists():
+        print(f"  [SKIP] File not found: {path}")
+        return None
+
+    df = load_year(path, year)
+    print(f"\n  Rows       : {len(df):,}")
+    print(f"  Date range : {df['timestamp'].min()} → {df['timestamp'].max()}")
+    print(f"  Counties   : {df['fips'].nunique():,}")
+
+    label_map = (
+        df.groupby("fips")[["county", "state"]]
+        .agg(lambda x: x.mode().iloc[0])
+        .to_dict("index")
+    )
+
+    print("  Building dense matrix …", flush=True)
+    pivot = build_dense_pivot(df)
+    print(f"  Dense size : {pivot.shape[0]:,} steps × {pivot.shape[1]:,} counties")
+
+    print("  Detecting events …", flush=True)
+    all_events = []
+    fips_list  = pivot.columns.tolist()
+
+    for idx, fips in enumerate(fips_list):
+        if idx % 300 == 0:
+            print(f"    {idx:,} / {len(fips_list):,} counties …", flush=True)
+
+        series = pivot[fips]
+        vals   = series.values
+        p90    = float(np.percentile(vals, 90))
+        thr    = max(p90, float(P90_FLOOR))
+
+        info   = label_map.get(fips, {"county": "", "state": ""})
+        events = detect_events_dense(
+            fips, series, thr, p90, info["county"], info["state"]
+        )
+        all_events.extend(events)
+
+    print(f"  Events found: {len(all_events):,}")
+
+    if not all_events:
+        return None
+
+    year_df         = pd.DataFrame(all_events)
+    year_df["year"] = year
+
+    out_path = OUTPUT_DIR / f"outage_events_{year}.csv"
+    year_df.to_csv(out_path, index=False)
+    print(f"  Saved → {out_path}")
+
+    return year_df
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+all_frames = []
+
+for year, path in sorted(INPUT_FILES.items()):
+    try:
+        result = process_year(year, path)
+        if result is not None:
+            all_frames.append(result)
+    except Exception as e:
+        print(f"\n  [ERROR] Year {year} failed: {e}")
+        print(f"  Skipping {year} and continuing …\n")
+        continue
+
+if all_frames:
+    combined = pd.concat(all_frames, ignore_index=True)
+    combined.sort_values(["fips_code", "event_start"], inplace=True)
+
+    out_combined = OUTPUT_DIR / "outage_events_2014_2025_combined.csv"
+    combined.to_csv(out_combined, index=False)
+
+    print(f"\n{'='*60}")
+    print(f"Combined file → {out_combined}")
+    print(f"Total events  : {len(combined):,}")
+
+    print("\n── Events per year ─────────────────────────────────────────────")
+    summary = (
+        combined.groupby("year")
+        .agg(
+            n_events     = ("fips_code",          "count"),
+            n_counties   = ("fips_code",          "nunique"),
+            avg_peak_out = ("peak_customers_out", "mean"),
+            max_peak_out = ("peak_customers_out", "max"),
+            avg_dur_hrs  = ("duration_min",       lambda x: round(x.mean() / 60, 1)),
+        )
+        .round(1)
+    )
+    print(summary.to_string())
+    print("────────────────────────────────────────────────────────────────")
+else:
+    print("\nNo events detected across any year.")
+
+print("\nDone.")

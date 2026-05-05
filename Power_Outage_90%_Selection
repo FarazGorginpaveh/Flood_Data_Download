@@ -1,316 +1,396 @@
 """
-Power Outage Event Detection — Eagle-I Data (All Years, 2014–2025)
-==================================================================
-Robust to column name variations across yearly files.
-Processes one CSV per year → one output CSV per year + combined file.
+2023 Standalone Pipeline
+========================
+Runs all three steps for 2023 only:
+  Step 1 — Detect outage events from eaglei_outages_2023.csv
+            → D:\Project_3\Joined_Output_4\outage_events_2023.csv
 
-Detection logic:
-  - Sparse → dense (zero-fill missing county/timestamp combos)
-  - Threshold = max(P90 over full-year dense series, 10)
-  - Event START : ≥ 4 consecutive 15-min steps above threshold (1 hour)
-  - Event END   : ≥ 12 consecutive 15-min steps below threshold (3 hours)
-  - Multi-peak  : dip < 12 steps below threshold keeps the event open
+  Step 2 — Join storm events × outage events
+            → D:\Project_3\Joined_Output_4\storm_outage_joined_2023.csv
+
+  Step 3 — Export normalized outage snapshots (zero-filled)
+            → D:\Project_3\Joined_Output_4\normalized_zerofill\normalized_2023.csv
+
+Robust column detection handles 2023 Eagle-I naming variations.
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore")
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-INPUT_DIR  = Path(r"D:\Project_3\Power_Try1")
-OUTPUT_DIR = Path(r"D:\Project_3\Joined_Output_4")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# ── Paths ──────────────────────────────────────────────────────────────────────
+EAGLEI_PATH  = Path(r"D:\Project_3\Power_Try1\eaglei_outages_2023.csv")
+STORM_DIR    = Path(r"D:\Flood_Data\Clean")
+OUTPUT_DIR   = Path(r"D:\Project_3\Joined_Output_4")
+NORM_DIR     = Path(r"D:\Project_3\Joined_Output_4\normalized_zerofill")
+NORM_DIR.mkdir(parents=True, exist_ok=True)
 
-INPUT_FILES = {
-    year: INPUT_DIR / f"eaglei_outages_{year}.csv"
-    for year in range(2014, 2026)
-}
+STORM_PATTERN = "StormEvents_details-ftp_v1.0_d2023_c*_clean.csv"
 
+YEAR       = 2023
+PRE_HOURS  =   6
+POST_HOURS = 336
+
+# Detection parameters
 START_STEPS = 4
 END_STEPS   = 12
-P90_FLOOR   = 10
+P90_FLOOR   = 10.0
 
-# ── Possible column name variants across Eagle-I yearly files ──────────────────
-# Each entry is a list of candidates in priority order (lowercase, stripped).
-COL_CANDIDATES = {
-    "fips"        : ["fips_code", "fips", "county_fips", "countyfips"],
-    "county"      : ["county", "county_name", "countyname"],
-    "state"       : ["state", "state_name", "statename"],
-    "customers_out": [
-        "customers_out",
-        "customersout",
-        "customers_affected",
-        "customersaffected",
-        "outage_count",
-        "outages",
-        "count",
-    ],
-    "timestamp"   : [
-        "run_start_time",
-        "run_start",
-        "timestamp",
-        "datetime",
-        "date_time",
-        "date",
-        "time",
-        "snapshot_time",
-    ],
+# Buffer windows for join (minutes)
+BUFFERS = {
+    "concurrent"  : 0,
+    "within_1hr"  :    60,
+    "within_3hr"  :   180,
+    "within_6hr"  :   360,
+    "within_12hr" :   720,
+    "within_24hr" :  1440,
+    "within_48hr" :  2880,
+    "within_96hr" :  5760,
+    "within_192hr": 11520,
 }
+MAX_BUFFER_MIN = 11520
 
 
-def resolve_columns(df: pd.DataFrame, year: int) -> dict[str, str]:
-    """
-    Match each logical column to the actual column name present in df.
-    Prints a diagnostic table so you can see exactly what was found.
-    Raises a clear error if a required column cannot be found.
-    """
-    cols_lower = {c.lower().strip(): c for c in df.columns}  # lower → original
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — OUTAGE EVENT DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+print(f"\n{'='*60}")
+print("STEP 1: Outage Event Detection")
+print(f"{'='*60}")
 
-    print(f"\n  Column mapping for {year}:")
-    print(f"  {'Logical':<18} {'Found as':<30} {'Original dtype'}")
-    print(f"  {'-'*18} {'-'*30} {'-'*15}")
-
-    mapping = {}
-    for logical, candidates in COL_CANDIDATES.items():
-        found = None
-        for cand in candidates:
-            if cand in cols_lower:
-                found = cols_lower[cand]
-                break
-        if found is None:
-            # Last resort: fuzzy — any col containing the first candidate word
-            keyword = candidates[0].split("_")[0]
-            matches = [orig for low, orig in cols_lower.items() if keyword in low]
-            if matches:
-                found = matches[0]
-
-        dtype = str(df[found].dtype) if found else "NOT FOUND"
-        print(f"  {logical:<18} {str(found):<30} {dtype}")
-        mapping[logical] = found
-
-    missing = [k for k, v in mapping.items() if v is None]
-    if missing:
-        print(f"\n  Available columns in file: {list(df.columns)}")
-        raise KeyError(
-            f"Year {year}: could not find columns for: {missing}.\n"
-            f"  Available columns: {list(df.columns)}\n"
-            f"  Add the correct name to COL_CANDIDATES at the top of this script."
-        )
-    return mapping
-
-
-def load_year(path: Path, year: int) -> tuple[pd.DataFrame, dict]:
+def load_eaglei(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, low_memory=False)
-    df.columns = df.columns.str.strip()  # strip whitespace, keep original case
+    df.columns = df.columns.str.strip().str.lower()
 
-    mapping = resolve_columns(df, year)
+    # Resolve timestamp
+    ts_col = next((c for c in df.columns if "time" in c or "date" in c), None)
+    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+    df.rename(columns={ts_col: "run_start_time"}, inplace=True)
 
-    # Rename to standard names
-    rename = {v: k for k, v in mapping.items() if v != k}
-    df.rename(columns=rename, inplace=True)
+    # Resolve FIPS
+    fips_col = next((c for c in df.columns if "fips" in c), None)
+    df[fips_col] = df[fips_col].astype(str).str.zfill(5)
+    df.rename(columns={fips_col: "fips_code"}, inplace=True)
 
-    df["timestamp"]    = pd.to_datetime(df["timestamp"])
-    df["fips"]         = df["fips"].astype(str).str.zfill(5)
-    df["customers_out"] = pd.to_numeric(df["customers_out"], errors="coerce").fillna(0)
+    # Resolve outage column
+    out_col = next(
+        (c for c in ["customers_out", "customersout", "customers_affected",
+                      "outage_count", "outages", "count", "sum"]
+         if c in df.columns), None
+    )
+    print(f"  Column mapping: fips={fips_col}, ts={ts_col}, outage={out_col}")
+    df["customers_out"] = pd.to_numeric(df[out_col], errors="coerce").fillna(0)
+
+    # Carry county/state labels
+    county_col = next((c for c in df.columns if "county" in c), None)
+    state_col  = next((c for c in df.columns if "state"  in c), None)
+    if county_col: df.rename(columns={county_col: "county"}, inplace=True)
+    if state_col:  df.rename(columns={state_col:  "state"},  inplace=True)
 
     return df
 
+print(f"  Loading {EAGLEI_PATH.name} …")
+raw = load_eaglei(EAGLEI_PATH)
+print(f"  Rows: {len(raw):,}  |  Counties: {raw['fips_code'].nunique():,}")
 
-def build_dense_pivot(df: pd.DataFrame) -> pd.DataFrame:
-    t_min     = df["timestamp"].min().floor("15min")
-    t_max     = df["timestamp"].max().ceil("15min")
-    full_grid = pd.date_range(start=t_min, end=t_max, freq="15min")
+# Build labels
+label_map = (
+    raw.groupby("fips_code")[["county", "state"]]
+    .agg(lambda x: x.mode().iloc[0])
+    .to_dict("index")
+)
 
-    agg = (
-        df.groupby(["fips", "timestamp"])["customers_out"]
-        .sum()
-        .reset_index()
-    )
-    pivot = (
-        agg.pivot(index="timestamp", columns="fips", values="customers_out")
-        .reindex(full_grid)
-        .fillna(0)
-        .astype(int)
-    )
-    return pivot
+# Build dense pivot
+print("  Building dense matrix …")
+agg = (raw.groupby(["fips_code", "run_start_time"])["customers_out"]
+          .sum().reset_index())
+t_min = raw["run_start_time"].min().floor("15min")
+t_max = raw["run_start_time"].max().ceil("15min")
+full_grid = pd.date_range(t_min, t_max, freq="15min")
+pivot = (
+    agg.pivot(index="run_start_time", columns="fips_code",
+              values="customers_out")
+    .reindex(full_grid).fillna(0).astype(int)
+)
+print(f"  Dense: {pivot.shape[0]:,} steps × {pivot.shape[1]:,} counties")
 
-
-def _summarise_event(fips, county, state, ev_times, ev_counts, threshold, p90):
+def _summarise(fips, county, state, ev_times, ev_counts, threshold, p90):
     return {
         "fips_code"                  : fips,
         "county"                     : county,
         "state"                      : state,
         "event_start"                : ev_times[0],
         "event_end"                  : ev_times[-1],
-        "duration_min"               : int(
-            (ev_times[-1] - ev_times[0]).total_seconds() / 60
-        ),
+        "duration_min"               : int((ev_times[-1]-ev_times[0]).total_seconds()/60),
         "peak_customers_out"         : int(ev_counts.max()),
         "mean_customers_out"         : round(float(ev_counts.mean()), 1),
         "threshold"                  : round(float(threshold), 2),
         "p90_customers_out"          : round(float(p90), 2),
         "n_snapshots_above_threshold": int((ev_counts > threshold).sum()),
+        "year"                       : YEAR,
     }
 
-
-def detect_events_dense(fips, series, threshold, p90, county, state) -> list:
-    times  = series.index
+def detect(fips, series, threshold, p90, county, state):
+    times = series.index
     counts = series.values
-    above  = counts > threshold
-
-    events       = []
-    in_event     = False
-    ev_start_i   = None
-    below_streak = 0
-    pend_end_i   = None
-    pre_streak   = 0
-    cand_start   = None
+    above = counts > threshold
+    events = []
+    in_event = False
+    ev_start_i = below_streak = pend_end_i = pre_streak = cand_start = None
 
     for i in range(len(times)):
         if not in_event:
             if above[i]:
-                pre_streak += 1
-                if pre_streak == 1:
-                    cand_start = i
+                pre_streak = (pre_streak or 0) + 1
+                if pre_streak == 1: cand_start = i
                 if pre_streak >= START_STEPS:
-                    in_event     = True
-                    ev_start_i   = cand_start
-                    below_streak = 0
-                    pend_end_i   = None
+                    in_event = True; ev_start_i = cand_start
+                    below_streak = 0; pend_end_i = None
             else:
-                pre_streak = 0
-                cand_start = None
+                pre_streak = 0; cand_start = None
         else:
             if above[i]:
-                below_streak = 0
-                pend_end_i   = None
+                below_streak = 0; pend_end_i = None
             else:
-                if below_streak == 0:
-                    pend_end_i = i
+                if below_streak == 0: pend_end_i = i
                 below_streak += 1
                 if below_streak >= END_STEPS:
-                    ev_counts = counts[ev_start_i:pend_end_i]
-                    ev_times  = times[ev_start_i:pend_end_i]
-                    if len(ev_times):
-                        events.append(_summarise_event(
-                            fips, county, state, ev_times, ev_counts,
-                            threshold, p90
-                        ))
-                    in_event     = False
-                    ev_start_i   = None
-                    below_streak = 0
-                    pend_end_i   = None
-                    pre_streak   = 0
-                    cand_start   = None
+                    ec = counts[ev_start_i:pend_end_i]
+                    et = times[ev_start_i:pend_end_i]
+                    if len(et): events.append(_summarise(fips, county, state, et, ec, threshold, p90))
+                    in_event = False; ev_start_i = below_streak = pend_end_i = pre_streak = cand_start = None
 
     if in_event and ev_start_i is not None:
-        end_i     = pend_end_i if pend_end_i is not None else len(times)
-        ev_counts = counts[ev_start_i:end_i]
-        ev_times  = times[ev_start_i:end_i]
-        if len(ev_times):
-            events.append(_summarise_event(
-                fips, county, state, ev_times, ev_counts, threshold, p90
-            ))
+        end_i = pend_end_i if pend_end_i else len(times)
+        ec = counts[ev_start_i:end_i]; et = times[ev_start_i:end_i]
+        if len(et): events.append(_summarise(fips, county, state, et, ec, threshold, p90))
     return events
 
+print("  Detecting events …")
+all_events = []
+for idx, fips in enumerate(pivot.columns):
+    if idx % 300 == 0: print(f"    {idx:,}/{len(pivot.columns):,} …", flush=True)
+    vals = pivot[fips].values
+    p90  = float(np.percentile(vals, 90))
+    thr  = max(p90, P90_FLOOR)
+    info = label_map.get(fips, {"county": "", "state": ""})
+    all_events.extend(detect(fips, pivot[fips], thr, p90,
+                              info["county"], info["state"]))
 
-def process_year(year: int, path: Path) -> pd.DataFrame | None:
-    print(f"\n{'='*60}")
-    print(f"  Processing {year}  →  {path.name}")
-    print(f"{'='*60}")
+outage_df = pd.DataFrame(all_events)
+outage_path = OUTPUT_DIR / "outage_events_2023.csv"
+outage_df.to_csv(outage_path, index=False)
+print(f"  Events detected: {len(outage_df):,}")
+print(f"  Saved → {outage_path.name}")
 
-    if not path.exists():
-        print(f"  [SKIP] File not found: {path}")
-        return None
 
-    df = load_year(path, year)
-    print(f"\n  Rows       : {len(df):,}")
-    print(f"  Date range : {df['timestamp'].min()} → {df['timestamp'].max()}")
-    print(f"  Counties   : {df['fips'].nunique():,}")
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — STORM × OUTAGE JOIN
+# ══════════════════════════════════════════════════════════════════════════════
+print(f"\n{'='*60}")
+print("STEP 2: Storm × Outage Temporal Join")
+print(f"{'='*60}")
 
-    label_map = (
-        df.groupby("fips")[["county", "state"]]
-        .agg(lambda x: x.mode().iloc[0])
-        .to_dict("index")
-    )
+# Load storm file
+storm_matches = sorted(STORM_DIR.glob(STORM_PATTERN))
+if not storm_matches:
+    raise FileNotFoundError(f"No storm file found matching {STORM_PATTERN} in {STORM_DIR}")
+storm_path = storm_matches[-1]
+print(f"  Storm file: {storm_path.name}")
 
-    print("  Building dense matrix …", flush=True)
-    pivot = build_dense_pivot(df)
-    print(f"  Dense size : {pivot.shape[0]:,} steps × {pivot.shape[1]:,} counties")
+storms = pd.read_csv(storm_path, low_memory=False)
+storms.columns = storms.columns.str.strip().str.lower()
 
-    print("  Detecting events …", flush=True)
-    all_events = []
-    fips_list  = pivot.columns.tolist()
+# Resolve timestamps
+start_col = next((c for c in storms.columns if "begin" in c or "start" in c), None)
+end_col   = next((c for c in storms.columns
+                  if ("end" in c or "finish" in c) and c != start_col), None)
+storms["storm_start"] = pd.to_datetime(storms[start_col], errors="coerce")
+storms["storm_end"]   = pd.to_datetime(storms[end_col],   errors="coerce")
+storms.dropna(subset=["storm_start", "storm_end"], inplace=True)
 
-    for idx, fips in enumerate(fips_list):
-        if idx % 300 == 0:
-            print(f"    {idx:,} / {len(fips_list):,} counties …", flush=True)
+# FIPS
+if "state_fips" in storms.columns and "county_fips" in storms.columns:
+    storms["fips_code"] = (storms["state_fips"].astype(str).str.zfill(2) +
+                           storms["county_fips"].astype(str).str.zfill(3))
+elif "fips_code" in storms.columns:
+    storms["fips_code"] = storms["fips_code"].astype(str).str.zfill(5)
+
+if "cz_type" in storms.columns:
+    storms = storms[storms["cz_type"].str.upper() == "C"].copy()
+
+storms["storm_duration_min"] = (
+    (storms["storm_end"] - storms["storm_start"]).dt.total_seconds() / 60
+).round(1)
+
+keep = [c for c in ["event_id","episode_id","event_type","fips_code",
+                     "state","county","storm_start","storm_end",
+                     "storm_duration_min","injuries_direct","deaths_direct",
+                     "damage_property","damage_crops","magnitude","magnitude_type"]
+        if c in storms.columns]
+storms = storms[keep].reset_index(drop=True)
+print(f"  Storm events: {len(storms):,}  |  Types: {storms['event_type'].nunique()}")
+
+# Join
+outage_df["event_start"] = pd.to_datetime(outage_df["event_start"])
+outage_df["event_end"]   = pd.to_datetime(outage_df["event_end"])
+outage_df["fips_code"]   = outage_df["fips_code"].astype(str).str.zfill(5)
+
+storm_grps  = {f: g.reset_index(drop=True) for f, g in storms.groupby("fips_code")}
+outage_grps = {f: g.reset_index(drop=True) for f, g in outage_df.groupby("fips_code")}
+common_fips = set(storm_grps) & set(outage_grps)
+print(f"  Counties with both datasets: {len(common_fips):,}")
+
+results = []
+for n, fips in enumerate(sorted(common_fips)):
+    if n % 100 == 0: print(f"    {n:,}/{len(common_fips):,} …", flush=True)
+    s_df = storm_grps[fips]
+    o_df = outage_grps[fips]
+
+    for _, storm in s_df.iterrows():
+        s_start = storm["storm_start"]; s_end = storm["storm_end"]
+        lo = s_start - pd.Timedelta(minutes=MAX_BUFFER_MIN)
+        hi = s_end   + pd.Timedelta(minutes=MAX_BUFFER_MIN)
+        candidates = o_df[(o_df["event_start"] <= hi) & (o_df["event_end"] >= lo)]
+
+        for _, outage in candidates.iterrows():
+            o_start = outage["event_start"]; o_end = outage["event_end"]
+            lag_min = (o_start - s_end).total_seconds() / 60
+            is_conc = (o_start <= s_end) and (o_end >= s_start)
+            overlap_min = 0.0
+            if is_conc:
+                overlap_min = max(0.0,
+                    (min(s_end, o_end) - max(s_start, o_start)).total_seconds() / 60)
+            direction = "concurrent" if is_conc else \
+                        ("outage_after_storm" if lag_min > 0 else "outage_before_storm")
+
+            abs_lag = abs(lag_min)
+            windows = ["concurrent"] if is_conc else []
+            for wn, wm in list(BUFFERS.items())[1:]:
+                if abs_lag <= wm: windows.append(wn)
+            if not windows: continue
+
+            base = {
+                "event_id": storm.get("event_id"),
+                "episode_id": storm.get("episode_id"),
+                "event_type": storm.get("event_type"),
+                "fips_code": fips,
+                "state": storm.get("state"),
+                "county": storm.get("county"),
+                "storm_start": s_start, "storm_end": s_end,
+                "storm_duration_min": storm.get("storm_duration_min"),
+                "damage_property": storm.get("damage_property"),
+                "damage_crops": storm.get("damage_crops"),
+                "injuries_direct": storm.get("injuries_direct"),
+                "deaths_direct": storm.get("deaths_direct"),
+                "magnitude": storm.get("magnitude"),
+                "magnitude_type": storm.get("magnitude_type"),
+                "outage_start": o_start, "outage_end": o_end,
+                "outage_duration_min": outage.get("duration_min"),
+                "peak_customers_out": outage.get("peak_customers_out"),
+                "mean_customers_out": outage.get("mean_customers_out"),
+                "threshold": outage.get("threshold"),
+                "p90_customers_out": outage.get("p90_customers_out"),
+                "n_snapshots_above": outage.get("n_snapshots_above_threshold"),
+                "lag_min": round(lag_min, 1),
+                "overlap_min": round(overlap_min, 1),
+                "direction": direction,
+            }
+            for win in windows:
+                results.append({**base, "temporal_window": win})
+
+joined = pd.DataFrame(results)
+join_path = OUTPUT_DIR / "storm_outage_joined_2023.csv"
+joined.to_csv(join_path, index=False)
+print(f"  Matched pairs: {len(joined):,}")
+print(f"  Saved → {join_path.name}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — NORMALIZED EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
+print(f"\n{'='*60}")
+print("STEP 3: Normalized Outage Export")
+print(f"{'='*60}")
+
+# Load concurrent events from joined file
+conc = joined[joined["temporal_window"] == "concurrent"].copy()
+conc["storm_start"]  = pd.to_datetime(conc["storm_start"],  errors="coerce")
+conc["storm_end"]    = pd.to_datetime(conc["storm_end"],    errors="coerce")
+conc["outage_start"] = pd.to_datetime(conc["outage_start"], errors="coerce")
+conc["outage_end"]   = pd.to_datetime(conc["outage_end"],   errors="coerce")
+conc.dropna(subset=["storm_start","storm_end","outage_start","outage_end"], inplace=True)
+conc = conc[conc["outage_end"] > conc["storm_start"]].copy()
+conc["peak_customers_out"] = pd.to_numeric(conc["peak_customers_out"], errors="coerce").fillna(0)
+conc["fips_code"] = conc["fips_code"].astype(str).str.zfill(5)
+conc = (conc.sort_values("peak_customers_out", ascending=False)
+            .drop_duplicates(subset=["event_id"])
+            .reset_index(drop=True))
+conc = conc[conc["peak_customers_out"] > 0].copy()
+print(f"  Events to export: {len(conc):,}")
+
+# County annual max from raw (already have pivot)
+county_annual_max = {fips: int(pivot[fips].max()) for fips in pivot.columns}
+
+needed_fips = set(conc["fips_code"])
+
+frames = []; missing = 0; errors = 0
+for _, ev in conc.iterrows():
+    try:
+        fips = str(ev["fips_code"]).zfill(5)
+        if fips not in pivot.columns:
+            missing += 1; continue
 
         series = pivot[fips]
-        vals   = series.values
-        p90    = float(np.percentile(vals, 90))
-        thr    = max(p90, float(P90_FLOOR))
+        t0 = pd.Timestamp(ev["storm_start"]).floor("15min")
+        lo = t0 - pd.Timedelta(hours=PRE_HOURS)
+        hi = t0 + pd.Timedelta(hours=POST_HOURS)
 
-        info   = label_map.get(fips, {"county": "", "state": ""})
-        events = detect_events_dense(
-            fips, series, thr, p90, info["county"], info["state"]
+        seg = series.loc[(series.index >= lo) & (series.index <= hi)].copy()
+        if seg.empty: missing += 1; continue
+
+        seg = seg.reset_index()
+        seg.columns = ["snapshot_time", "customers_out_raw"]
+        seg["rel_hours"] = ((seg["snapshot_time"] - t0).dt.total_seconds() / 3600).round(4)
+
+        window_peak = float(seg["customers_out_raw"].max())
+        seg["customers_out_normalized"] = (
+            (seg["customers_out_raw"] / window_peak).round(6) if window_peak > 0 else 0.0
         )
-        all_events.extend(events)
+        seg["window_peak_customers_out"] = window_peak
+        seg["county_annual_max"] = county_annual_max.get(fips, np.nan)
 
-    print(f"  Events found: {len(all_events):,}")
+        for col in ["event_id","episode_id","event_type","fips_code","county","state",
+                    "storm_start","storm_end","storm_duration_min",
+                    "outage_start","outage_end","outage_duration_min"]:
+            seg[col] = ev.get(col, np.nan)
 
-    if not all_events:
-        return None
+        out_cols = ["event_id","episode_id","event_type","fips_code","county","state",
+                    "storm_start","storm_end","storm_duration_min",
+                    "outage_start","outage_end","outage_duration_min",
+                    "window_peak_customers_out","county_annual_max",
+                    "snapshot_time","rel_hours",
+                    "customers_out_raw","customers_out_normalized"]
+        frames.append(seg[[c for c in out_cols if c in seg.columns]])
 
-    year_df         = pd.DataFrame(all_events)
-    year_df["year"] = year
-
-    out_path = OUTPUT_DIR / f"outage_events_{year}.csv"
-    year_df.to_csv(out_path, index=False)
-    print(f"  Saved → {out_path}")
-
-    return year_df
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-all_frames = []
-
-for year, path in sorted(INPUT_FILES.items()):
-    try:
-        result = process_year(year, path)
-        if result is not None:
-            all_frames.append(result)
     except Exception as e:
-        print(f"\n  [ERROR] Year {year} failed: {e}")
-        print(f"  Skipping {year} and continuing …\n")
-        continue
+        errors += 1
+        print(f"  [ERROR] event_id={ev.get('event_id')}: {e}")
 
-if all_frames:
-    combined = pd.concat(all_frames, ignore_index=True)
-    combined.sort_values(["fips_code", "event_start"], inplace=True)
+print(f"  Events with data : {len(frames):,}")
+print(f"  Events missing   : {missing:,}")
+print(f"  Events errored   : {errors:,}")
 
-    out_combined = OUTPUT_DIR / "outage_events_2014_2025_combined.csv"
-    combined.to_csv(out_combined, index=False)
-
-    print(f"\n{'='*60}")
-    print(f"Combined file → {out_combined}")
-    print(f"Total events  : {len(combined):,}")
-
-    print("\n── Events per year ─────────────────────────────────────────────")
-    summary = (
-        combined.groupby("year")
-        .agg(
-            n_events     = ("fips_code",          "count"),
-            n_counties   = ("fips_code",          "nunique"),
-            avg_peak_out = ("peak_customers_out", "mean"),
-            max_peak_out = ("peak_customers_out", "max"),
-            avg_dur_hrs  = ("duration_min",       lambda x: round(x.mean() / 60, 1)),
-        )
-        .round(1)
-    )
-    print(summary.to_string())
-    print("────────────────────────────────────────────────────────────────")
-else:
-    print("\nNo events detected across any year.")
+if frames:
+    year_df = pd.concat(frames, ignore_index=True)
+    year_df["year"] = YEAR
+    out_path = NORM_DIR / f"normalized_{YEAR}.csv"
+    year_df.to_csv(out_path, index=False)
+    print(f"  Total rows : {len(year_df):,}")
+    print(f"  Norm range : {year_df['customers_out_normalized'].min():.4f} → "
+          f"{year_df['customers_out_normalized'].max():.4f}")
+    print(f"  Saved → {out_path}")
 
 print("\nDone.")

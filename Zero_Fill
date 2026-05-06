@@ -1,0 +1,157 @@
+"""
+Zero-Fill Time Series Export — 2020 to 2025 (Chunked Read)
+===========================================================
+Same logic as the working 2014-2019 script but reads the raw
+CSV in chunks to avoid the MemoryError on large files.
+
+Output: D:\Project_3\Power_Stats\zerofill\zerofill_YYYY.csv
+Columns: fips_code | county | state | snapshot_time | customers_out
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import warnings, gc
+warnings.filterwarnings("ignore")
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+INPUT_DIR  = Path(r"D:\Project_3\Power_Try1")
+OUTPUT_DIR = Path(r"D:\Project_3\Power_Stats\zerofill")
+YEARS      = range(2020, 2026)
+CHUNKSIZE  = 1_000_000      # rows per chunk — adjust down if still OOM
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── MAIN LOOP ─────────────────────────────────────────────────────────────────
+for year in YEARS:
+    in_path = INPUT_DIR / f"eaglei_outages_{year}.csv"
+    if not in_path.exists():
+        print(f"[SKIP] {in_path.name} not found")
+        continue
+
+    print(f"\n{'='*60}")
+    print(f"  Processing {year} …")
+
+    # ── Pass 1: chunked read → aggregate per chunk → concat & re-aggregate ────
+    print("  Pass 1: chunked read & aggregate …")
+    chunk_aggs  = []
+    label_rows  = []
+    ts_col = fips_col = out_col = county_col = state_col = None
+
+    reader = pd.read_csv(in_path, low_memory=False, chunksize=CHUNKSIZE)
+    for ci, chunk in enumerate(reader):
+        chunk.columns = chunk.columns.str.strip().str.lower()
+
+        # Resolve column names once
+        if ci == 0:
+            ts_col     = next((c for c in chunk.columns if "time" in c or "date" in c), None)
+            fips_col   = next((c for c in chunk.columns if "fips" in c), None)
+            out_col    = next((c for c in ["customers_out","customersout",
+                                            "customers_affected","outage_count",
+                                            "outages","count","sum"]
+                               if c in chunk.columns), None)
+            county_col = next((c for c in chunk.columns if "county" in c), None)
+            state_col  = next((c for c in chunk.columns if "state"  in c), None)
+            print(f"    cols → ts:{ts_col} fips:{fips_col} out:{out_col}")
+
+        chunk["snapshot_time"] = pd.to_datetime(chunk[ts_col], errors="coerce")
+        chunk["fips_code"]     = chunk[fips_col].astype(str).str.zfill(5)
+        chunk["customers_out"] = pd.to_numeric(chunk[out_col], errors="coerce").fillna(0).astype(np.int32)
+        chunk["county"]        = chunk[county_col]
+        chunk["state"]         = chunk[state_col]
+        chunk.dropna(subset=["snapshot_time"], inplace=True)
+
+        # Collect labels
+        label_rows.append(
+            chunk.groupby("fips_code")[["county","state"]]
+            .agg(lambda x: x.mode().iloc[0])
+        )
+
+        # Aggregate this chunk
+        chunk_agg = (
+            chunk.groupby(["fips_code","snapshot_time"])["customers_out"]
+            .sum().reset_index()
+        )
+        chunk_aggs.append(chunk_agg)
+
+        del chunk, chunk_agg
+        gc.collect()
+
+        if (ci + 1) % 10 == 0:
+            print(f"    chunk {ci+1} done …", flush=True)
+
+    # Combine all chunk aggregates and re-aggregate (handles cross-chunk duplicates)
+    print("  Combining chunk aggregates …")
+    agg = pd.concat(chunk_aggs, ignore_index=True)
+    del chunk_aggs; gc.collect()
+
+    agg = (
+        agg.groupby(["fips_code","snapshot_time"])["customers_out"]
+        .sum().reset_index()
+    )
+    agg["customers_out"] = agg["customers_out"].astype(np.int32)
+
+    label_map = pd.concat(label_rows).reset_index()
+    label_map = (
+        label_map.groupby("fips_code")[["county","state"]]
+        .agg(lambda x: x.mode().iloc[0])
+    )
+    del label_rows; gc.collect()
+
+    print(f"  Aggregated rows: {len(agg):,} | Counties: {agg['fips_code'].nunique():,}")
+
+    # ── Build grid ────────────────────────────────────────────────────────────
+    t_min = agg["snapshot_time"].min().floor("15min")
+    t_max = agg["snapshot_time"].max().ceil("15min")
+    full_grid = pd.date_range(t_min, t_max, freq="15min")
+    print(f"  Grid: {t_min} → {t_max}  ({len(full_grid):,} steps)")
+
+    # ── Pass 2: stream county-by-county to CSV ────────────────────────────────
+    out_path    = OUTPUT_DIR / f"zerofill_{year}.csv"
+    all_fips    = sorted(agg["fips_code"].unique())
+    first_chunk = True
+    total_rows  = nonzero_rows = 0
+
+    print(f"  Streaming {len(all_fips):,} counties …")
+    for i, fips in enumerate(all_fips):
+        if i % 500 == 0:
+            print(f"    {i:,}/{len(all_fips):,} …", flush=True)
+
+        series = (
+            agg.loc[agg["fips_code"] == fips]
+               .set_index("snapshot_time")["customers_out"]
+               .reindex(full_grid, fill_value=0)
+               .astype(np.int32)
+        )
+
+        if series.max() == 0:
+            continue
+
+        chunk = pd.DataFrame({
+            "fips_code"    : fips,
+            "county"       : label_map.loc[fips, "county"] if fips in label_map.index else "",
+            "state"        : label_map.loc[fips, "state"]  if fips in label_map.index else "",
+            "snapshot_time": full_grid,
+            "customers_out": series.values,
+        })
+
+        chunk.to_csv(out_path, mode="w" if first_chunk else "a",
+                     header=first_chunk, index=False)
+        first_chunk = False
+
+        total_rows   += len(chunk)
+        nonzero_rows += int((chunk["customers_out"] > 0).sum())
+
+        del chunk, series
+
+    pct_nz = nonzero_rows / total_rows * 100 if total_rows else 0
+    print(f"  Total rows   : {total_rows:,}")
+    print(f"  Nonzero rows : {nonzero_rows:,}  ({pct_nz:.1f}%)")
+    print(f"  Zero rows    : {total_rows - nonzero_rows:,}  ({100-pct_nz:.1f}%)")
+    print(f"  Saved → {out_path}")
+
+    # ── Full cleanup before next year ─────────────────────────────────────────
+    del agg, label_map, full_grid, all_fips
+    gc.collect()
+    print(f"  RAM cleared.")
+
+print("\n✓ All years (2020–2025) complete.")

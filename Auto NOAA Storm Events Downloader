@@ -1,0 +1,542 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed May 13 18:50:53 2026
+
+@author: mh01
+"""
+
+# -*- coding: utf-8 -*-
+"""
+NOAA Storm Events Downloader
+=============================
+Downloads NOAA Storm Events data filtered by:
+  - Event type  (e.g. Flood, Tornado, Hurricane)
+  - State and/or county
+  - Date range
+Saves one filtered CSV.
+"""
+
+import re
+import gzip
+import shutil
+import calendar
+import requests
+import pandas as pd
+from pathlib import Path
+from datetime import date
+from bs4 import BeautifulSoup
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+STORM_BASE_URL = "https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/"
+STORM_MIN_YEAR = 1950
+MAX_YEAR       = date.today().year
+
+# All states available in Storm Events (full CONUS + territories)
+ALL_STATES = {
+    "AL": "Alabama",        "AK": "Alaska",         "AZ": "Arizona",
+    "AR": "Arkansas",       "CA": "California",     "CO": "Colorado",
+    "CT": "Connecticut",    "DE": "Delaware",        "FL": "Florida",
+    "GA": "Georgia",        "HI": "Hawaii",          "ID": "Idaho",
+    "IL": "Illinois",       "IN": "Indiana",         "IA": "Iowa",
+    "KS": "Kansas",         "KY": "Kentucky",        "LA": "Louisiana",
+    "ME": "Maine",          "MD": "Maryland",        "MA": "Massachusetts",
+    "MI": "Michigan",       "MN": "Minnesota",       "MS": "Mississippi",
+    "MO": "Missouri",       "MT": "Montana",         "NE": "Nebraska",
+    "NV": "Nevada",         "NH": "New Hampshire",   "NJ": "New Jersey",
+    "NM": "New Mexico",     "NY": "New York",        "NC": "North Carolina",
+    "ND": "North Dakota",   "OH": "Ohio",            "OK": "Oklahoma",
+    "OR": "Oregon",         "PA": "Pennsylvania",    "RI": "Rhode Island",
+    "SC": "South Carolina", "SD": "South Dakota",    "TN": "Tennessee",
+    "TX": "Texas",          "UT": "Utah",            "VT": "Vermont",
+    "VA": "Virginia",       "WA": "Washington",      "WV": "West Virginia",
+    "WI": "Wisconsin",      "WY": "Wyoming",
+}
+
+# Common event types in NOAA Storm Events
+KNOWN_EVENT_TYPES = [
+    "Astronomical Low Tide", "Avalanche", "Blizzard", "Coastal Flood",
+    "Cold/Wind Chill", "Debris Flow", "Dense Fog", "Dense Smoke",
+    "Drought", "Dust Devil", "Dust Storm", "Excessive Heat",
+    "Extreme Cold/Wind Chill", "Flash Flood", "Flood", "Freezing Fog",
+    "Frost/Freeze", "Funnel Cloud", "Hail", "Heat", "Heavy Rain",
+    "Heavy Snow", "High Surf", "High Wind", "Hurricane", "Hurricane (Typhoon)",
+    "Ice Storm", "Lake-Effect Snow", "Lakeshore Flood", "Lightning",
+    "Marine Dense Fog", "Marine Hail", "Marine Heavy Freezing Spray",
+    "Marine High Wind", "Marine Hurricane/Typhoon", "Marine Lightning",
+    "Marine Strong Wind", "Marine Thunderstorm Wind", "Marine Tropical Depression",
+    "Marine Tropical Storm", "Rip Current", "Seiche", "Sleet",
+    "Storm Surge/Tide", "Strong Wind", "Thunderstorm Wind", "Tornado",
+    "Tropical Depression", "Tropical Storm", "Tsunami", "Volcanic Ash",
+    "Waterspout", "Wildfire", "Winter Storm", "Winter Weather",
+]
+
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
+
+def print_header(title):
+    print("\n" + "=" * 60)
+    print(f"  {title}")
+    print("=" * 60)
+
+def print_columns(items, ncols=3):
+    """Print a list in evenly spaced columns."""
+    col_w = 28
+    for i, item in enumerate(items):
+        end = "\n" if (i + 1) % ncols == 0 or i == len(items) - 1 else ""
+        print(f"  {item:<{col_w}}", end=end)
+
+# ============================================================
+# INPUT: EVENT TYPES
+# ============================================================
+
+def ask_event_types():
+    print_header("SELECT EVENT TYPE(S)")
+    print("  Known event types:\n")
+    print_columns(KNOWN_EVENT_TYPES, ncols=3)
+    print()
+    print("  Options:")
+    print("    [ALL]  All event types")
+    print("    Type one or more names separated by commas")
+    print("    Partial match is supported (e.g. 'flood' matches Flash Flood, Flood, etc.)\n")
+
+    while True:
+        raw = input("  Your choice: ").strip()
+        if not raw:
+            print("  ⚠  Please enter at least one event type or ALL.")
+            continue
+
+        if raw.upper() == "ALL":
+            print("  Selected: all event types.")
+            return None  # None means no filter applied
+
+        # Split and do case-insensitive partial match
+        terms = [t.strip().lower() for t in raw.split(",") if t.strip()]
+        matched = [e for e in KNOWN_EVENT_TYPES if any(t in e.lower() for t in terms)]
+
+        # Also allow exact custom types not in the known list
+        for term in terms:
+            exact = [e for e in KNOWN_EVENT_TYPES if e.lower() == term]
+            if not exact:
+                # Add as-is (capitalised) in case it exists in data
+                custom = term.title()
+                if custom not in matched:
+                    matched.append(custom)
+
+        if not matched:
+            print("  ⚠  No matching event types found. Try again or type ALL.")
+            continue
+
+        print(f"\n  Selected event type(s):")
+        for e in matched:
+            print(f"    - {e}")
+        return matched
+
+# ============================================================
+# INPUT: STATES
+# ============================================================
+
+def ask_states():
+    print_header("SELECT STATE(S)")
+    print("  Available state abbreviations:\n")
+
+    abbrevs = sorted(ALL_STATES.keys())
+    col_w = 22
+    for i, ab in enumerate(abbrevs):
+        label = f"{ab} - {ALL_STATES[ab]}"
+        end = "\n" if (i + 1) % 3 == 0 or i == len(abbrevs) - 1 else ""
+        print(f"  {label:<{col_w}}", end=end)
+
+    print("\n\n  Options:")
+    print("    [ALL]  All states")
+    print("    Type abbreviations separated by commas (e.g. AL,FL,TX)\n")
+
+    while True:
+        raw = input("  Your choice: ").strip().upper()
+
+        if raw == "ALL":
+            print(f"  Selected: all {len(ALL_STATES)} states.")
+            return None  # None means no state filter
+
+        codes = [c.strip() for c in raw.split(",") if c.strip()]
+        invalid = [c for c in codes if c not in ALL_STATES]
+        if invalid:
+            print(f"  ⚠  Unknown abbreviation(s): {', '.join(invalid)}. Try again.")
+            continue
+        if not codes:
+            print("  ⚠  No codes entered. Try again.")
+            continue
+
+        selected = {ab: ALL_STATES[ab] for ab in codes}
+        print(f"\n  Selected: {', '.join(selected.values())}")
+        return selected  # dict of AB -> Name
+
+# ============================================================
+# INPUT: COUNTIES
+# ============================================================
+
+def ask_counties(selected_states):
+    print_header("SELECT COUNTY/COUNTIES  (optional)")
+
+    if selected_states is None:
+        print("  You selected all states — county filtering is only available")
+        print("  when one or more specific states are chosen.")
+        ans = input("\n  Skip county filter? [Y/n]: ").strip().lower()
+        if ans in ("", "y", "yes"):
+            return None
+        print("  Please re-run and select specific states to enable county filtering.")
+        return None
+
+    print("  Enter county names separated by commas to filter further.")
+    print("  Partial match is supported (e.g. 'wash' matches Washita, Washington, etc.)")
+    print("  Press Enter to skip and keep all counties in selected state(s).\n")
+
+    raw = input("  County name(s) [or Enter to skip]: ").strip()
+    if not raw:
+        print("  No county filter applied.")
+        return None
+
+    terms = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    print(f"  Will filter for counties matching: {', '.join(terms)}")
+    return terms  # list of lowercase partial strings
+
+# ============================================================
+# INPUT: DATE RANGE
+# ============================================================
+
+def ask_date(label, after_date=None):
+    print(f"\n  --- {label} ---")
+    while True:
+        try:
+            year = int(input(f"  Year  [{STORM_MIN_YEAR}-{MAX_YEAR}]: ").strip())
+            if not (STORM_MIN_YEAR <= year <= MAX_YEAR):
+                print(f"  ⚠  Must be {STORM_MIN_YEAR}-{MAX_YEAR}.")
+                continue
+            break
+        except ValueError:
+            print("  ⚠  Enter a valid year.")
+
+    while True:
+        try:
+            month = int(input("  Month [1-12]: ").strip())
+            if not (1 <= month <= 12):
+                print("  ⚠  Must be 1-12.")
+                continue
+            break
+        except ValueError:
+            print("  ⚠  Enter a valid month.")
+
+    _, last = calendar.monthrange(year, month)
+    while True:
+        try:
+            day = int(input(f"  Day   [1-{last}]: ").strip())
+            if not (1 <= day <= last):
+                print(f"  ⚠  Must be 1-{last}.")
+                continue
+            d = date(year, month, day)
+            if after_date and d < after_date:
+                print(f"  ⚠  Must be on or after {after_date}.")
+                continue
+            return d
+        except ValueError:
+            print("  ⚠  Enter a valid day.")
+
+def ask_date_range():
+    print_header("SELECT DATE RANGE")
+    print(f"  Earliest available: {STORM_MIN_YEAR}-01-01")
+    print(f"  Latest available  : {MAX_YEAR}-12-31")
+    start = ask_date("Start date")
+    end   = ask_date("End date", after_date=start)
+    print(f"\n  Selected: {start} -> {end}")
+    return start, end
+
+# ============================================================
+# INPUT: OUTPUT FOLDER
+# ============================================================
+
+def ask_output_folder():
+    print_header("OUTPUT FOLDER")
+    default = r"D:\Flood_Data\StormEvents"
+
+    while True:
+        val = input(f"  Folder to save all files\n  [{default}]: ").strip()
+        p = Path(val or default)
+
+        if p.suffix:
+            print(f"  ⚠  That looks like a file (has extension '{p.suffix}'). Enter a folder.")
+            continue
+
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            test = p / "_write_test.tmp"
+            test.write_text("ok")
+            test.unlink()
+            print(f"  OK  Folder ready: {p}")
+            return p
+        except PermissionError:
+            print(f"  ⚠  Cannot write to: {p}. Try a different path.")
+        except Exception as e:
+            print(f"  ⚠  Error: {e}")
+
+# ============================================================
+# CONFIRM
+# ============================================================
+
+def confirm_settings(event_types, states, counties, start_date, end_date, out_folder):
+    print_header("CONFIRM SETTINGS")
+    print(f"  Event types : {', '.join(event_types) if event_types else 'ALL'}")
+    if states:
+        print(f"  States      : {', '.join(states.values())}")
+    else:
+        print(f"  States      : ALL")
+    if counties:
+        print(f"  Counties    : partial match on {', '.join(counties)}")
+    else:
+        print(f"  Counties    : ALL")
+    print(f"  Date range  : {start_date} -> {end_date}")
+    print(f"  Output      : {out_folder}")
+    print()
+    ans = input("  Proceed? [Y/n]: ").strip().lower()
+    return ans in ("", "y", "yes")
+
+# ============================================================
+# DOWNLOAD & FILTER
+# ============================================================
+
+def fetch_file_listing():
+    print("  Fetching file listing from NOAA ...")
+    resp = requests.get(STORM_BASE_URL, timeout=60)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    files = [
+        a.get("href") for a in soup.find_all("a")
+        if a.get("href") and re.match(
+            r"StormEvents_details-ftp_v1\.0_d\d{4}_c\d{8}\.csv\.gz",
+            a.get("href", "")
+        )
+    ]
+    print(f"  Found {len(files)} detail files on server.")
+    return files
+
+
+def download_and_extract(filename, gz_dir, csv_dir):
+    gz_path  = gz_dir / filename
+    csv_path = csv_dir / filename[:-3]
+
+    if not gz_path.exists():
+        url = STORM_BASE_URL + filename
+        print(f"  [DOWNLOADING] {filename} ...")
+        r = requests.get(url, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(gz_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk: f.write(chunk)
+        print(f"  [OK] Downloaded.")
+    else:
+        print(f"  [SKIP] Already downloaded: {filename}")
+
+    if not csv_path.exists():
+        print(f"  [EXTRACTING] {csv_path.name} ...")
+        with gzip.open(gz_path, "rb") as f_in, open(csv_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        print(f"  [OK] Extracted.")
+    else:
+        print(f"  [SKIP] Already extracted: {csv_path.name}")
+
+    return csv_path
+
+
+def filter_dataframe(df, event_types, states, counties, start_date, end_date):
+    original_len = len(df)
+
+    # --- Date filter ---
+    if "BEGIN_YEARMONTH" in df.columns and "BEGIN_DAY" in df.columns:
+        df["begin_date"] = pd.to_datetime(
+            df["BEGIN_YEARMONTH"].astype(str).str.zfill(6) +
+            df["BEGIN_DAY"].astype(str).str.zfill(2),
+            format="%Y%m%d", errors="coerce"
+        )
+        df = df[
+            (df["begin_date"] >= pd.Timestamp(start_date)) &
+            (df["begin_date"] <= pd.Timestamp(end_date))
+        ].copy()
+
+    # --- State filter ---
+    if states and "STATE" in df.columns:
+        state_names_upper = {n.upper() for n in states.values()}
+        df = df[df["STATE"].str.upper().isin(state_names_upper)].copy()
+
+    # --- County filter ---
+    if counties and "CZ_NAME" in df.columns:
+        mask = df["CZ_NAME"].str.lower().apply(
+            lambda name: any(term in str(name).lower() for term in counties)
+        )
+        df = df[mask].copy()
+
+    # --- Event type filter ---
+    if event_types and "EVENT_TYPE" in df.columns:
+        et_upper = [e.upper() for e in event_types]
+        df = df[df["EVENT_TYPE"].str.upper().isin(et_upper)].copy()
+
+    return df, original_len
+
+
+def build_output_columns(df):
+    """Standardise and clean up the output DataFrame."""
+
+    # Build begin_date string column
+    if "begin_date" in df.columns:
+        df["begin_date_str"] = df["begin_date"].dt.strftime("%Y-%m-%d")
+    
+    # Build end_date
+    if "END_YEARMONTH" in df.columns and "END_DAY" in df.columns:
+        df["end_date"] = pd.to_datetime(
+            df["END_YEARMONTH"].astype(str).str.zfill(6) +
+            df["END_DAY"].astype(str).str.zfill(2),
+            format="%Y%m%d", errors="coerce"
+        )
+        df["end_date_str"] = df["end_date"].dt.strftime("%Y-%m-%d")
+
+    # Build 5-digit county FIPS
+    if "STATE_FIPS" in df.columns and "CZ_FIPS" in df.columns:
+        df["county_fips"] = (
+            df["STATE_FIPS"].astype(str).str.zfill(2) +
+            df["CZ_FIPS"].astype(str).str.zfill(3)
+        )
+
+    # Select and rename key columns for the output
+    col_map = {
+        "begin_date_str" : "begin_date",
+        "end_date_str"   : "end_date",
+        "county_fips"    : "county_fips",
+        "CZ_NAME"        : "county_name",
+        "STATE"          : "state_name",
+        "STATE_FIPS"     : "state_fips",
+        "EVENT_TYPE"     : "event_type",
+        "EPISODE_ID"     : "episode_id",
+        "EVENT_ID"       : "event_id",
+        "CZ_TYPE"        : "cz_type",
+        "WFO"            : "wfo",
+        "CZ_TIMEZONE"    : "timezone",
+        "BEGIN_TIME"     : "begin_time",
+        "END_TIME"       : "end_time",
+        "INJURIES_DIRECT"   : "injuries_direct",
+        "INJURIES_INDIRECT" : "injuries_indirect",
+        "DEATHS_DIRECT"     : "deaths_direct",
+        "DEATHS_INDIRECT"   : "deaths_indirect",
+        "DAMAGE_PROPERTY"   : "damage_property",
+        "DAMAGE_CROPS"      : "damage_crops",
+        "MAGNITUDE"         : "magnitude",
+        "MAGNITUDE_TYPE"    : "magnitude_type",
+        "FLOOD_CAUSE"       : "flood_cause",
+        "TOR_F_SCALE"       : "tornado_f_scale",
+        "TOR_LENGTH"        : "tornado_length_mi",
+        "TOR_WIDTH"         : "tornado_width_yd",
+        "BEGIN_LAT"         : "begin_lat",
+        "BEGIN_LON"         : "begin_lon",
+        "END_LAT"           : "end_lat",
+        "END_LON"           : "end_lon",
+        "EPISODE_NARRATIVE" : "episode_narrative",
+        "EVENT_NARRATIVE"   : "event_narrative",
+    }
+
+    # Keep only columns that exist
+    rename = {k: v for k, v in col_map.items() if k in df.columns}
+    out = df.rename(columns=rename)
+
+    # Final column order — put key fields first, rest after
+    key_cols = [
+        "begin_date", "end_date", "event_type", "county_fips",
+        "county_name", "state_name", "state_fips",
+    ]
+    rest = [c for c in out.columns if c not in key_cols
+            and c not in ["begin_date", "end_date", "begin_date", "end_date"]]
+    final_cols = [c for c in key_cols if c in out.columns] + rest
+    return out[final_cols]
+
+
+# ============================================================
+# MAIN DOWNLOAD LOOP
+# ============================================================
+
+def run(event_types, states, counties, start_date, end_date, out_folder):
+    print_header("DOWNLOADING STORM EVENTS")
+
+    gz_dir  = out_folder / "gz_files"
+    csv_dir = out_folder / "csv_files"
+    gz_dir.mkdir(exist_ok=True)
+    csv_dir.mkdir(exist_ok=True)
+
+    detail_files = fetch_file_listing()
+    all_rows = []
+
+    for year in range(start_date.year, end_date.year + 1):
+        print(f"\n  Year: {year}")
+        pattern = rf"StormEvents_details-ftp_v1\.0_d{year}_c\d{{8}}\.csv\.gz"
+        matches = [f for f in detail_files if re.fullmatch(pattern, f)]
+        if not matches:
+            print(f"  [SKIP] No file found for {year}.")
+            continue
+
+        try:
+            csv_path = download_and_extract(matches[0], gz_dir, csv_dir)
+            df = pd.read_csv(csv_path, low_memory=False)
+            df, original_len = filter_dataframe(
+                df, event_types, states, counties, start_date, end_date
+            )
+            print(f"  [FILTER] {original_len:,} rows -> {len(df):,} after filter")
+            if not df.empty:
+                all_rows.append(df)
+        except Exception as e:
+            print(f"  [ERROR] {year}: {e}")
+
+    if not all_rows:
+        print("\n  ⚠  No records matched your filters.")
+        return
+
+    combined = pd.concat(all_rows, ignore_index=True)
+    combined = build_output_columns(combined)
+
+    # Save
+    tag_states  = "_".join(sorted(states.keys()))       if states       else "ALL_STATES"
+    tag_events  = "_".join(e.replace(" ", "")[:8] for e in (event_types or []))[:40] or "ALL_EVENTS"
+    out_csv = out_folder / f"storm_events_{start_date}_{end_date}_{tag_states}_{tag_events}.csv"
+    combined.to_csv(out_csv, index=False)
+
+    print_header("DONE")
+    print(f"  Total records : {len(combined):,}")
+    print(f"  Columns       : {len(combined.columns)}")
+    print(f"  Saved to      : {out_csv}")
+    print()
+    preview = [c for c in ["begin_date", "event_type", "county_name", "state_name", "county_fips"]
+               if c in combined.columns]
+    print(combined[preview].head(10).to_string(index=False))
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("\n" + "=" * 60)
+    print("  NOAA STORM EVENTS DOWNLOADER")
+    print("=" * 60)
+
+    event_types  = ask_event_types()
+    states       = ask_states()
+    counties     = ask_counties(states)
+    start_date, end_date = ask_date_range()
+    out_folder   = ask_output_folder()
+
+    if not confirm_settings(event_types, states, counties, start_date, end_date, out_folder):
+        print("\n  Cancelled.")
+        return
+
+    run(event_types, states, counties, start_date, end_date, out_folder)
+
+
+if __name__ == "__main__":
+    main()

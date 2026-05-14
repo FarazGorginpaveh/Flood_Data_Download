@@ -1,0 +1,240 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed May 13 19:00:28 2026
+
+@author: mh01
+"""
+
+# -*- coding: utf-8 -*-
+"""
+NOAA Flood Events Downloader — Southern States
+===============================================
+Downloads all Coastal Flood, Flash Flood, Flood, and Lakeshore Flood
+events for NC, SC, TX, AL, GA, FL, MS, LA from 1950 to present.
+Saves one filtered CSV to D:\Flood_Data\Southern States Floods
+"""
+
+import re
+import gzip
+import shutil
+import requests
+import pandas as pd
+from pathlib import Path
+from datetime import date
+from bs4 import BeautifulSoup
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+FLOOD_TYPES = {
+    "COASTAL FLOOD",
+    "FLASH FLOOD",
+    "FLOOD",
+    "LAKESHORE FLOOD",
+}
+
+TARGET_STATES = {
+    "NORTH CAROLINA",
+    "SOUTH CAROLINA",
+    "TEXAS",
+    "ALABAMA",
+    "GEORGIA",
+    "FLORIDA",
+    "MISSISSIPPI",
+    "LOUISIANA",
+}
+
+START_YEAR     = 1950
+END_YEAR       = date.today().year
+STORM_BASE_URL = "https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/"
+OUT_DIR        = Path(r"D:\Flood_Data\Southern States Floods")
+GZ_DIR         = OUT_DIR / "gz_files"
+CSV_DIR        = OUT_DIR / "csv_files"
+
+# ============================================================
+# SETUP
+# ============================================================
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+GZ_DIR.mkdir(exist_ok=True)
+CSV_DIR.mkdir(exist_ok=True)
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def fetch_file_listing():
+    print("Fetching file listing from NOAA ...")
+    resp = requests.get(STORM_BASE_URL, timeout=60)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    files = [
+        a.get("href") for a in soup.find_all("a")
+        if a.get("href") and re.match(
+            r"StormEvents_details-ftp_v1\.0_d\d{4}_c\d{8}\.csv\.gz",
+            a.get("href", "")
+        )
+    ]
+    print(f"Found {len(files)} detail files on server.\n")
+    return files
+
+
+def download_and_extract(filename):
+    gz_path  = GZ_DIR  / filename
+    csv_path = CSV_DIR / filename[:-3]
+
+    if not gz_path.exists():
+        print(f"  [DOWNLOADING] {filename} ...")
+        r = requests.get(STORM_BASE_URL + filename, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(gz_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk: f.write(chunk)
+        print(f"  [OK] Downloaded.")
+    else:
+        print(f"  [SKIP] Already downloaded: {filename}")
+
+    if not csv_path.exists():
+        print(f"  [EXTRACTING] {csv_path.name} ...")
+        with gzip.open(gz_path, "rb") as f_in, open(csv_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        print(f"  [OK] Extracted.")
+    else:
+        print(f"  [SKIP] Already extracted: {csv_path.name}")
+
+    return csv_path
+
+
+def filter_and_clean(df):
+    # Filter by state
+    if "STATE" in df.columns:
+        df = df[df["STATE"].str.upper().isin(TARGET_STATES)].copy()
+
+    # Filter by flood event type
+    if "EVENT_TYPE" in df.columns:
+        df = df[df["EVENT_TYPE"].str.upper().isin(FLOOD_TYPES)].copy()
+
+    if df.empty:
+        return df
+
+    # Build begin_date
+    if "BEGIN_YEARMONTH" in df.columns and "BEGIN_DAY" in df.columns:
+        df["begin_date"] = pd.to_datetime(
+            df["BEGIN_YEARMONTH"].astype(str).str.zfill(6) +
+            df["BEGIN_DAY"].astype(str).str.zfill(2),
+            format="%Y%m%d", errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+
+    # Build end_date
+    if "END_YEARMONTH" in df.columns and "END_DAY" in df.columns:
+        df["end_date"] = pd.to_datetime(
+            df["END_YEARMONTH"].astype(str).str.zfill(6) +
+            df["END_DAY"].astype(str).str.zfill(2),
+            format="%Y%m%d", errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+
+    # Build 5-digit county FIPS
+    if "STATE_FIPS" in df.columns and "CZ_FIPS" in df.columns:
+        df["county_fips"] = (
+            df["STATE_FIPS"].astype(str).str.zfill(2) +
+            df["CZ_FIPS"].astype(str).str.zfill(3)
+        )
+
+    # Rename and select output columns
+    rename_map = {
+        "EVENT_TYPE"        : "event_type",
+        "STATE"             : "state_name",
+        "STATE_FIPS"        : "state_fips",
+        "CZ_NAME"           : "county_name",
+        "CZ_TYPE"           : "cz_type",
+        "EPISODE_ID"        : "episode_id",
+        "EVENT_ID"          : "event_id",
+        "WFO"               : "wfo",
+        "CZ_TIMEZONE"       : "timezone",
+        "BEGIN_TIME"        : "begin_time",
+        "END_TIME"          : "end_time",
+        "INJURIES_DIRECT"   : "injuries_direct",
+        "INJURIES_INDIRECT" : "injuries_indirect",
+        "DEATHS_DIRECT"     : "deaths_direct",
+        "DEATHS_INDIRECT"   : "deaths_indirect",
+        "DAMAGE_PROPERTY"   : "damage_property",
+        "DAMAGE_CROPS"      : "damage_crops",
+        "FLOOD_CAUSE"       : "flood_cause",
+        "MAGNITUDE"         : "magnitude",
+        "MAGNITUDE_TYPE"    : "magnitude_type",
+        "BEGIN_LAT"         : "begin_lat",
+        "BEGIN_LON"         : "begin_lon",
+        "END_LAT"           : "end_lat",
+        "END_LON"           : "end_lon",
+        "EPISODE_NARRATIVE" : "episode_narrative",
+        "EVENT_NARRATIVE"   : "event_narrative",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Final column order
+    key_cols = ["begin_date", "end_date", "event_type",
+                "county_fips", "county_name", "state_name", "state_fips"]
+    rest = [c for c in df.columns if c not in key_cols]
+    return df[[c for c in key_cols if c in df.columns] + rest]
+
+# ============================================================
+# MAIN
+# ============================================================
+
+print("=" * 60)
+print("  NOAA FLOOD EVENTS — SOUTHERN STATES")
+print("=" * 60)
+print(f"  Event types : {', '.join(sorted(FLOOD_TYPES))}")
+print(f"  States      : {', '.join(sorted(TARGET_STATES))}")
+print(f"  Years       : {START_YEAR} - {END_YEAR}")
+print(f"  Output      : {OUT_DIR}")
+print("=" * 60 + "\n")
+
+detail_files = fetch_file_listing()
+all_rows = []
+
+for year in range(START_YEAR, END_YEAR + 1):
+    print(f"Year: {year}")
+    pattern = rf"StormEvents_details-ftp_v1\.0_d{year}_c\d{{8}}\.csv\.gz"
+    matches = [f for f in detail_files if re.fullmatch(pattern, f)]
+
+    if not matches:
+        print(f"  [SKIP] No file found for {year}.\n")
+        continue
+
+    try:
+        csv_path = download_and_extract(matches[0])
+        df = pd.read_csv(csv_path, low_memory=False)
+        df = filter_and_clean(df)
+        print(f"  [FILTER] {len(df):,} flood records matched.")
+        if not df.empty:
+            all_rows.append(df)
+    except Exception as e:
+        print(f"  [ERROR] {year}: {e}")
+
+    print()
+
+# ============================================================
+# SAVE
+# ============================================================
+
+print("=" * 60)
+if not all_rows:
+    print("  No records matched. Nothing saved.")
+else:
+    combined = pd.concat(all_rows, ignore_index=True)
+    out_csv  = OUT_DIR / f"flood_events_southern_states_{START_YEAR}_{END_YEAR}.csv"
+    combined.to_csv(out_csv, index=False)
+
+    print(f"  Total records : {len(combined):,}")
+    print(f"  Columns       : {len(combined.columns)}")
+    print(f"  Saved to      : {out_csv}")
+    print()
+    preview = [c for c in ["begin_date", "end_date", "event_type", "county_name", "state_name", "county_fips"]
+               if c in combined.columns]
+    print(combined[preview].head(10).to_string(index=False))
+
+print("=" * 60)
+print("  DONE")
+print("=" * 60)

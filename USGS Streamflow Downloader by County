@@ -1,0 +1,354 @@
+import time
+import requests
+import pandas as pd
+from io import StringIO
+from pathlib import Path
+from datetime import datetime
+
+# ============================================================
+# OUTPUT FOLDER
+# ============================================================
+
+OUT_DIR = Path(r"D:\Flood_Data\StreamFlow")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# USGS parameter code
+# 00060 = discharge / streamflow, cubic feet per second
+PARAMETER_CD = "00060"
+
+USGS_SITE_URL = "https://waterservices.usgs.gov/nwis/site/"
+USGS_IV_URL   = "https://waterservices.usgs.gov/nwis/iv/"
+
+
+# ============================================================
+# USER INPUTS
+# ============================================================
+
+county_input = input(
+    "Enter county FIPS code(s), separated by commas. Example: 01125,01073,06037: "
+)
+
+START_DATE = input("Enter start date in YYYY-MM-DD format. Example: 2020-01-01: ")
+END_DATE   = input("Enter end date in YYYY-MM-DD format. Example: 2020-01-10: ")
+
+COUNTY_FIPS_LIST = [
+    x.strip().zfill(5)
+    for x in county_input.split(",")
+    if x.strip() != ""
+]
+
+# Check dates
+try:
+    datetime.strptime(START_DATE, "%Y-%m-%d")
+    datetime.strptime(END_DATE, "%Y-%m-%d")
+except ValueError:
+    raise ValueError("Dates must be in YYYY-MM-DD format.")
+
+if len(COUNTY_FIPS_LIST) == 0:
+    raise ValueError("No county FIPS codes were entered.")
+
+print("\nCounties to download:")
+print(COUNTY_FIPS_LIST)
+print(f"Date range: {START_DATE} to {END_DATE}")
+print(f"Output folder: {OUT_DIR}")
+
+
+# ============================================================
+# HELPER FUNCTION TO READ USGS RDB FORMAT
+# ============================================================
+
+def read_usgs_rdb(url, params, timeout=60):
+    """
+    Reads USGS tab-delimited RDB response.
+    Removes comment lines and the metadata row.
+    Prints useful error messages if the request fails.
+    """
+    response = requests.get(url, params=params, timeout=timeout)
+
+    if response.status_code != 200:
+        print("\nUSGS request failed.")
+        print("URL:", response.url)
+        print("Status code:", response.status_code)
+        print("Response text:")
+        print(response.text[:1500])
+        response.raise_for_status()
+
+    text = response.text
+
+    # Remove comment lines
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+
+    if len(lines) < 3:
+        return pd.DataFrame()
+
+    # First line is header
+    # Second line is USGS data-type metadata
+    # Remaining lines are actual data
+    cleaned_text = "\n".join([lines[0]] + lines[2:])
+
+    if cleaned_text.strip() == "":
+        return pd.DataFrame()
+
+    return pd.read_csv(StringIO(cleaned_text), sep="\t", dtype=str)
+
+
+# ============================================================
+# FIND USGS STREAMFLOW GAUGES IN ONE COUNTY
+# ============================================================
+
+def get_streamflow_sites_for_county(county_fips):
+    """
+    Finds USGS stream sites with discharge data inside one county.
+
+    countyCd must be full 5-digit county FIPS.
+    Example:
+        Tuscaloosa County, Alabama = 01125
+    """
+    county_fips = str(county_fips).zfill(5)
+
+    params = {
+        "format": "rdb",
+        "countyCd": county_fips,
+        "parameterCd": PARAMETER_CD,
+        "siteType": "ST",
+        "siteStatus": "all"
+    }
+
+    sites = read_usgs_rdb(USGS_SITE_URL, params)
+
+    if sites.empty:
+        return pd.DataFrame()
+
+    keep_cols = [
+        "agency_cd",
+        "site_no",
+        "station_nm",
+        "site_tp_cd",
+        "dec_lat_va",
+        "dec_long_va",
+        "state_cd",
+        "county_cd",
+        "huc_cd"
+    ]
+
+    keep_cols = [c for c in keep_cols if c in sites.columns]
+    sites = sites[keep_cols].drop_duplicates()
+
+    sites["county_fips"] = county_fips
+
+    return sites
+
+
+# ============================================================
+# DOWNLOAD INSTANTANEOUS STREAMFLOW FOR ONE GAUGE
+# ============================================================
+
+def download_streamflow_for_site(site_no, start_date, end_date):
+    """
+    Downloads instantaneous streamflow from USGS for one site.
+    """
+    params = {
+        "format": "rdb",
+        "sites": site_no,
+        "parameterCd": PARAMETER_CD,
+        "startDT": start_date,
+        "endDT": end_date,
+        "siteStatus": "all"
+    }
+
+    df = read_usgs_rdb(USGS_IV_URL, params)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Find streamflow column
+    value_col = None
+
+    if PARAMETER_CD in df.columns:
+        value_col = PARAMETER_CD
+    else:
+        possible_cols = [
+            c for c in df.columns
+            if PARAMETER_CD in c and not c.endswith("_cd")
+        ]
+        if len(possible_cols) > 0:
+            value_col = possible_cols[0]
+
+    if value_col is None:
+        print(f"No streamflow column found for site {site_no}")
+        print("Columns returned:", df.columns.tolist())
+        return pd.DataFrame()
+
+    df = df.rename(columns={value_col: "streamflow_cfs"})
+
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+
+    df["streamflow_cfs"] = pd.to_numeric(df["streamflow_cfs"], errors="coerce")
+
+    return df
+
+
+# ============================================================
+# DOWNLOAD ONE COUNTY
+# ============================================================
+
+def run_one_county_download(county_fips, start_date, end_date):
+    county_fips = str(county_fips).zfill(5)
+
+    print("\n" + "=" * 80)
+    print(f"County FIPS: {county_fips}")
+    print("=" * 80)
+
+    county_dir = OUT_DIR / county_fips
+    county_dir.mkdir(parents=True, exist_ok=True)
+
+    # --------------------------------------------------------
+    # Step 1: Find gauges
+    # --------------------------------------------------------
+    print(f"Finding USGS streamflow gauges for county {county_fips}...")
+
+    try:
+        sites_df = get_streamflow_sites_for_county(county_fips)
+    except Exception as e:
+        print(f"Failed to find gauges for county {county_fips}: {e}")
+        return {
+            "county_fips": county_fips,
+            "status": "failed_site_search",
+            "number_of_gauges_found": 0,
+            "number_of_files_downloaded": 0,
+            "number_of_empty_sites": 0,
+            "number_of_failed_sites": 0
+        }
+
+    if sites_df.empty:
+        print(f"No USGS streamflow gauges found for county {county_fips}.")
+        return {
+            "county_fips": county_fips,
+            "status": "no_gauges",
+            "number_of_gauges_found": 0,
+            "number_of_files_downloaded": 0,
+            "number_of_empty_sites": 0,
+            "number_of_failed_sites": 0
+        }
+
+    sites_file = county_dir / f"usgs_streamflow_sites_{county_fips}.csv"
+    sites_df.to_csv(sites_file, index=False)
+
+    print(f"Found {len(sites_df)} streamflow gauge(s).")
+    print(f"Gauge list saved to: {sites_file}")
+
+    display_cols = [
+        c for c in ["site_no", "station_nm", "dec_lat_va", "dec_long_va"]
+        if c in sites_df.columns
+    ]
+    print(sites_df[display_cols].head(10))
+
+    # --------------------------------------------------------
+    # Step 2: Download streamflow for each gauge
+    # --------------------------------------------------------
+    downloaded_files = []
+    failed_sites = []
+    empty_sites = []
+
+    for _, site in sites_df.iterrows():
+        site_no = site["site_no"]
+        station_name = site.get("station_nm", "")
+
+        print(f"\nDownloading site {site_no}: {station_name}")
+
+        out_file = county_dir / f"{site_no}_streamflow_iv_{start_date}_{end_date}.csv"
+
+        if out_file.exists():
+            print(f"  File already exists. Skipping: {out_file}")
+            downloaded_files.append(str(out_file))
+            continue
+
+        try:
+            q = download_streamflow_for_site(site_no, start_date, end_date)
+
+            if q.empty:
+                print(f"  No streamflow data returned for site {site_no}")
+                empty_sites.append(site_no)
+                continue
+
+            # Add station metadata
+            q["county_fips"] = county_fips
+            q["station_name"] = station_name
+            q["latitude"] = site.get("dec_lat_va", None)
+            q["longitude"] = site.get("dec_long_va", None)
+
+            q.to_csv(out_file, index=False)
+
+            print(f"  Saved: {out_file}")
+            print(f"  Rows: {len(q):,}")
+
+            if "datetime" in q.columns:
+                print(f"  Time range: {q['datetime'].min()} to {q['datetime'].max()}")
+
+            downloaded_files.append(str(out_file))
+
+        except Exception as e:
+            print(f"  Failed for site {site_no}: {e}")
+            failed_sites.append(site_no)
+
+        # Be polite to USGS server
+        time.sleep(0.5)
+
+    # --------------------------------------------------------
+    # Step 3: Save county summary
+    # --------------------------------------------------------
+    summary = {
+        "county_fips": county_fips,
+        "status": "completed",
+        "start_date": start_date,
+        "end_date": end_date,
+        "number_of_gauges_found": len(sites_df),
+        "number_of_files_downloaded": len(downloaded_files),
+        "number_of_empty_sites": len(empty_sites),
+        "number_of_failed_sites": len(failed_sites),
+        "empty_sites": ";".join(empty_sites),
+        "failed_sites": ";".join(failed_sites)
+    }
+
+    summary_df = pd.DataFrame([summary])
+    summary_file = county_dir / f"download_summary_{county_fips}_{start_date}_{end_date}.csv"
+    summary_df.to_csv(summary_file, index=False)
+
+    print(f"\nCounty summary saved to: {summary_file}")
+
+    return summary
+
+
+# ============================================================
+# RUN FOR ALL USER-ENTERED COUNTIES
+# ============================================================
+
+all_summaries = []
+
+for county_fips in COUNTY_FIPS_LIST:
+    summary = run_one_county_download(
+        county_fips=county_fips,
+        start_date=START_DATE,
+        end_date=END_DATE
+    )
+    all_summaries.append(summary)
+
+    # Pause between counties
+    time.sleep(1)
+
+
+# ============================================================
+# SAVE MASTER SUMMARY
+# ============================================================
+
+master_summary = pd.DataFrame(all_summaries)
+
+master_summary_file = OUT_DIR / f"master_download_summary_{START_DATE}_{END_DATE}.csv"
+master_summary.to_csv(master_summary_file, index=False)
+
+print("\n" + "=" * 80)
+print("ALL DOWNLOADS FINISHED")
+print("=" * 80)
+print(master_summary)
+print(f"\nMaster summary saved to: {master_summary_file}")

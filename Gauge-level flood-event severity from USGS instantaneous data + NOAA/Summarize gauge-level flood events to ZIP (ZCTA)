@@ -1,0 +1,106 @@
+"""
+Summarize gauge-level flood events to ZIP (ZCTA) x year.
+=========================================================
+Consumes the flood_events CSV from flood_event_severity.py plus the ZCTA
+shapefile. Each gauge is a POINT assigned to the ZCTA that contains it; a ZIP's
+statistics are the statistics of the gauged basins inside it -- NOT a claim that
+one gauge represents the whole ZIP. Most ZIPs contain no gauge and get no row.
+
+Aggregation uses the basin-comparable severity (severity_excess_depth_in,
+inches of excess runoff), because raw cfs*hr volumes are not comparable across
+basins of different size.
+
+Output (per ZIP per year):
+  n_gauges, n_events,
+  max_severity_depth_in, mean_severity_depth_in,   <- recommended (comparable)
+  max_peak_discharge_cfs, max_peak_stage_above_action_ft,
+  gauge_list
+
+    pip install geopandas shapely pandas
+"""
+
+from pathlib import Path
+import pandas as pd
+import geopandas as gpd
+
+SHARE = Path("/icebox/data/shares/mh1/fgorginpaveh/Tuft/Climate Data")
+_EVENTS_DIR = SHARE / "Flood_Events_Louisiana"
+# prefer the full-run file; fall back to the TEST file if that's all that exists
+_FULL = _EVENTS_DIR / "flood_events_louisiana.csv"
+_TEST = _EVENTS_DIR / "flood_events_TEST.csv"
+EVENTS_CSV = _FULL if _FULL.exists() else _TEST
+ZCTA_SHP = SHARE / "US Zipcode Shapefile" / "tl_2022_us_zcta520.shp"
+OUT_DIR = _EVENTS_DIR
+LA_BBOX = (-94.2, 28.8, -88.7, 33.1)      # minx,miny,maxx,maxy for reading ZCTAs
+
+SEV = "severity_pctl_depth_in"            # percentile-gated, basin-comparable severity
+
+
+def main():
+    if not EVENTS_CSV.exists():
+        raise FileNotFoundError(
+            f"No events file found. Run flood_event_severity.py first.\n"
+            f"  looked for: {_FULL}\n"
+            f"          and: {_TEST}")
+    print(f"reading events from {EVENTS_CSV.name}")
+    ev = pd.read_csv(EVENTS_CSV, dtype={"usgs_site_id": str, "nws_location_id": str})
+    print(f"{len(ev)} events across {ev['usgs_site_id'].nunique()} gauges")
+
+    # one point per gauge
+    sites = (ev.drop_duplicates("usgs_site_id")
+             [["usgs_site_id", "station_name", "latitude", "longitude"]].dropna())
+    gpts = gpd.GeoDataFrame(
+        sites, geometry=gpd.points_from_xy(sites.longitude, sites.latitude), crs=4326)
+
+    zc = gpd.read_file(ZCTA_SHP, bbox=LA_BBOX)
+    zcol = "ZCTA5CE20" if "ZCTA5CE20" in zc.columns else "GEOID20"
+    zc = zc[[zcol, "geometry"]].rename(columns={zcol: "zip"}).to_crs(4326)
+
+    joined = gpd.sjoin(gpts, zc, how="left", predicate="within")
+    gauge_zip = joined.set_index("usgs_site_id")["zip"]
+    ev["zip"] = ev["usgs_site_id"].map(gauge_zip)
+
+    unmatched = ev["zip"].isna().sum()
+    if unmatched:
+        print(f"note: {unmatched} events at gauges outside any ZCTA (dropped)")
+    ev = ev.dropna(subset=["zip"])
+
+    ev["peak_above_action_ft"] = ev["peak_gage_height_ft"] - ev["action_stage_ft"]
+
+    # ZIP x year summary
+    rows = []
+    for (z, yr), g in ev.groupby(["zip", "year"]):
+        rows.append({
+            "zip": z, "year": int(yr),
+            "n_gauges": g["usgs_site_id"].nunique(),
+            "n_events": len(g),
+            "max_severity_pctl_depth_in": g[SEV].max(),
+            "mean_severity_pctl_depth_in": g[SEV].mean(),
+            "max_peak_pctl": g["peak_pctl"].max(),
+            "max_peak_discharge_cfs": g["peak_discharge_cfs"].max(),
+            "max_peak_stage_above_action_ft": g["peak_above_action_ft"].max(),
+            "gauge_list": ",".join(sorted(g["usgs_site_id"].unique())),
+        })
+    zip_year = pd.DataFrame(rows).sort_values(["zip", "year"])
+
+    # ZIP-level (all-years) rollup -> ONE severity number per ZIP
+    zip_all = (zip_year.groupby("zip")
+               .agg(n_gauges=("n_gauges", "max"),
+                    n_events=("n_events", "sum"),
+                    years_with_events=("year", "nunique"),
+                    max_severity_pctl_depth_in=("max_severity_pctl_depth_in", "max"),
+                    mean_severity_pctl_depth_in=("mean_severity_pctl_depth_in", "mean"))
+               .reset_index())
+
+    zip_year.to_csv(OUT_DIR / "flood_events_by_zip_year.csv", index=False)
+    zip_all.to_csv(OUT_DIR / "flood_events_by_zip.csv", index=False)
+
+    print(f"\nZIPs with >=1 gauged event: {zip_year['zip'].nunique()}")
+    print(f"-> {OUT_DIR/'flood_events_by_zip_year.csv'}")
+    print(f"-> {OUT_DIR/'flood_events_by_zip.csv'}")
+    print("\nSample:")
+    print(zip_year.head(10).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,536 @@
+"""
+Gauge-level flood-event severity from USGS instantaneous data + NOAA/NWS action stage
+=====================================================================================
+Approach follows Khajehei, Ahmadalipour, Shao & Moradkhani (2020),
+Sci. Rep. 10:448, doi:10.1038/s41598-019-57349-z.
+
+  * Event START  = first time observed USGS gage height (00065) exceeds the
+                   NOAA/NWS action stage (feet).
+  * Event PEAK   = maximum discharge (00060) within the (declustered) event.
+  * RISE TIME    = hours from start to peak-discharge time.
+  * SEVERITY     = peak discharge / rise time      (paper definition).
+
+Data sources
+  * USGS instantaneous values  : dataretrieval.nwis.get_iv()  (00060, 00065)
+        - legacy NWIS service; returns both params, UTC tz-aware index, QC flags.
+        - modern replacement (USGS decommissions legacy ~Q1 2027):
+              from dataretrieval import waterdata
+              waterdata.get_continuous(monitoring_location_id='USGS-XXXXXXXX',
+                                       parameter_code='00065',
+                                       time='2015-01-01/2015-12-31')
+          (one parameter per call; merge 00060 and 00065 on time).
+  * NWS action stage + USGS<->NWS crosswalk : NWPS all-gauges report CSV.
+
+IMPORTANT CAVEATS
+  * Instantaneous data for most gauges does NOT extend back to 2000; the archive
+    typically begins mid-2000s. The code reports each site's actual span.
+  * NWPS action stage is the CURRENT threshold applied to historical events.
+
+    pip install dataretrieval pandas numpy requests
+"""
+
+import logging
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+from dataretrieval import nwis
+
+# also used (optional) for drainage area -> comparable severity:
+from dataretrieval import waterdata
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+STATE = "LA"                       # NWPS 2-letter state filter
+START_YEAR, END_YEAR = 2000, 2025  # fixed range (simple + fast); 2025 = last complete year
+
+OUT_DIR = Path("/icebox/data/shares/mh1/fgorginpaveh/Tuft/Climate Data/Flood_Events_Louisiana")
+RAW_DIR = OUT_DIR / "raw_iv"       # per-site cached instantaneous data
+NWPS_REPORT_URL = "https://water.noaa.gov/resources/downloads/reports/nwps_all_gauges_report.csv"
+
+DISCHARGE = "00060"                # cfs
+GAGE_HT = "00065"                  # ft
+
+# event logic
+MIN_BELOW_HOURS = 12.0             # gage must stay below action stage this long to end an event
+MAX_GAP_HOURS = 6.0               # cap a single obs gap when integrating time-above / coverage
+
+# percentile-based severity: baseline for the excess-volume integral is the p-th
+# percentile of the gauge's own instantaneous discharge. Use a HIGH percentile for
+# floods (95-99). Also used to gate marginal events via the peak's percentile rank.
+SEVERITY_PERCENTILE = 95.0
+
+TEST_MODE = False                  # False = ALL matched LA gauges, 2000-2023
+TEST_N = 3
+
+# ============================================================
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(),
+              logging.FileHandler(OUT_DIR / "flood_events.log")],
+)
+log = logging.getLogger("flood")
+
+# the USGS client logs every request at INFO; quiet it so our messages are readable
+for _noisy in ("httpx", "httpcore", "dataretrieval", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+# ------------------------------------------------------------
+# 1. NWPS crosswalk + action stage
+# ------------------------------------------------------------
+def load_nwps(state):
+    """Download the NWPS all-gauges report and return LA sites with an action stage."""
+    from io import StringIO
+    import time
+
+    local_copy = OUT_DIR / "nwps_all_gauges_report.csv"
+    text = None
+
+    # try the live report a few times (the NWPS API is not supported 24/7)
+    headers = {"User-Agent": "flood-severity-research/1.0 (contact: your@email)"}
+    for attempt in range(1, 4):
+        try:
+            log.info("Downloading NWPS all-gauges report (attempt %d) ...", attempt)
+            r = requests.get(NWPS_REPORT_URL, headers=headers, timeout=180)
+            r.raise_for_status()
+            body = r.text
+            if body and "usgs id" in body.lower() and len(body) > 1000:
+                text = body
+                local_copy.write_text(body)          # cache for offline fallback
+                break
+            log.warning("report looked empty/invalid (%d bytes); retrying", len(body or ""))
+        except Exception as e:
+            log.warning("download failed: %s", e)
+        time.sleep(10)
+
+    # fall back to a previously saved copy if the live fetch failed
+    if text is None and local_copy.exists() and local_copy.stat().st_size > 1000:
+        log.warning("using cached local copy: %s", local_copy)
+        text = local_copy.read_text()
+
+    if not text:
+        raise RuntimeError(
+            "Could not obtain the NWPS all-gauges report. The service may be down "
+            "(it is not supported 24/7). Try again shortly, or manually download "
+            f"{NWPS_REPORT_URL} to {local_copy} and rerun.")
+
+    df = pd.read_csv(StringIO(text), dtype=str)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    ren = {
+        "nws shef id": "nws_location_id",
+        "usgs id": "usgs_site_id",
+        "location name": "station_name",
+        "latitude": "latitude", "longitude": "longitude",
+        "action stage": "action_stage_ft",
+        "flood stage unit": "stage_unit",
+        "state": "state", "timezone": "timezone", "county": "county",
+    }
+    df = df.rename(columns={k: v for k, v in ren.items() if k in df.columns})
+    df = df[df["state"].str.upper() == state.upper()].copy()
+
+    # numeric cleanups
+    for c in ("latitude", "longitude", "action_stage_ft"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # NWPS encodes "no data" as -9999 (and similar). A valid number, so it must be
+    # masked explicitly or every observation reads as "above threshold".
+    df.loc[df["action_stage_ft"] <= -900, "action_stage_ft"] = np.nan
+    df["usgs_site_id"] = (df["usgs_site_id"].astype(str).str.strip()
+                          .replace({"": np.nan, "nan": np.nan}))
+
+    # classify why a site may be unusable
+    def status(row):
+        if pd.isna(row["usgs_site_id"]):
+            return "no_usgs_match"
+        if pd.isna(row["action_stage_ft"]):
+            return "no_action_stage"
+        if str(row.get("stage_unit", "")).lower() not in ("ft", "feet", ""):
+            return "action_stage_not_ft"
+        return "ok"
+
+    df["match_status"] = df.apply(status, axis=1)
+    usable = df[df["match_status"] == "ok"].drop_duplicates("usgs_site_id")
+    log.info("NWPS %s: %d rows, %d usable (usgs id + action stage in ft)",
+             state, len(df), len(usable))
+    df[df["match_status"] != "ok"][
+        ["usgs_site_id", "nws_location_id", "station_name", "match_status"]
+    ].to_csv(OUT_DIR / "skipped_sites_crosswalk.csv", index=False)
+    return usable
+
+
+# ------------------------------------------------------------
+# 2. USGS instantaneous fetch (cached, per site, yearly chunks)
+# ------------------------------------------------------------
+def fetch_iv(site):
+    """Instantaneous 00060 + 00065 for one site over [START_YEAR, END_YEAR].
+    Cached to parquet. Returns tidy df or None."""
+    cache = RAW_DIR / f"{site}.parquet"
+    if cache.exists():
+        try:
+            return pd.read_parquet(cache)
+        except Exception:
+            cache.unlink(missing_ok=True)
+
+    frames = []
+    for yr in range(START_YEAR, END_YEAR + 1):
+        try:
+            raw, _ = nwis.get_iv(
+                sites=site, start=f"{yr}-01-01", end=f"{yr}-12-31",
+                parameterCd=f"{DISCHARGE},{GAGE_HT}", multi_index=False)
+        except Exception as e:
+            # no data for that year is normal (IV archive often starts mid-2000s)
+            continue
+        if raw is None or len(raw) == 0:
+            continue
+        raw = raw.reset_index().rename(columns={"index": "datetime", "datetime": "datetime"})
+        # locate the value + qualifier columns (names can carry a ts-id suffix)
+        def pick(pref):
+            exact = [c for c in raw.columns if c == pref]
+            if exact:
+                return exact[0]
+            cand = [c for c in raw.columns if c.startswith(pref) and not c.endswith("_cd")]
+            return cand[0] if cand else None
+        qcol, hcol = pick(DISCHARGE), pick(GAGE_HT)
+        if hcol is None:                     # gage height is mandatory for this method
+            continue
+        out = pd.DataFrame({"datetime_utc": pd.to_datetime(raw["datetime"], utc=True)})
+        out["gage_height_ft"] = pd.to_numeric(raw[hcol], errors="coerce") if hcol else np.nan
+        out["discharge_cfs"] = pd.to_numeric(raw[qcol], errors="coerce") if qcol else np.nan
+        hcd, qcd = f"{hcol}_cd" if hcol else None, f"{qcol}_cd" if qcol else None
+        out["gh_flag"] = raw[hcd] if hcd in raw.columns else ""
+        out["q_flag"] = raw[qcd] if qcd in raw.columns else ""
+        frames.append(out)
+
+    if not frames:
+        return None
+    df = (pd.concat(frames, ignore_index=True)
+          .dropna(subset=["gage_height_ft"])
+          .drop_duplicates("datetime_utc")
+          .sort_values("datetime_utc")
+          .reset_index(drop=True))
+    df.to_parquet(cache, index=False)
+    return df
+
+
+# ------------------------------------------------------------
+# 3. Event detection + metrics
+# ------------------------------------------------------------
+def detect_events(df, action_stage, tz):
+    """Return a list of event-metric dicts for one site.
+    df: columns datetime_utc, gage_height_ft, discharge_cfs, gh_flag, q_flag."""
+    if action_stage is None or np.isnan(action_stage) or action_stage <= -900:
+        return []                       # no valid threshold -> nothing to detect
+    t = df["datetime_utc"].values
+    gh = df["gage_height_ft"].values
+    q = df["discharge_cfs"].values
+    n = len(df)
+    if n < 2:
+        return []
+
+    # per-gauge discharge percentile: statistical baseline for severity, computed
+    # once over the whole record (all flows, not just flood periods).
+    q_finite = q[np.isfinite(q)]
+    q_pctl = float(np.percentile(q_finite, SEVERITY_PERCENTILE)) if q_finite.size else np.nan
+
+    hours = (df["datetime_utc"].astype("int64").to_numpy() / 3.6e12)  # ns -> hours
+    above = gh > action_stage
+
+    # group consecutive above-threshold observations into raw runs
+    runs = []
+    i = 0
+    while i < n:
+        if above[i]:
+            j = i
+            while j + 1 < n and above[j + 1]:
+                j += 1
+            runs.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    if not runs:
+        return []
+
+    # merge runs separated by a below-threshold gap shorter than MIN_BELOW_HOURS
+    merged = [list(runs[0])]
+    for a, b in runs[1:]:
+        gap = hours[a] - hours[merged[-1][1]]
+        if gap < MIN_BELOW_HOURS:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+
+    events = []
+    for k, (a, b) in enumerate(merged, 1):
+        sl = slice(a, b + 1)
+        q_ev = q[sl]
+        if np.all(np.isnan(q_ev)):
+            peak_idx_local = int(np.nanargmax(np.where(np.isnan(q_ev), -np.inf, q_ev))) \
+                if not np.all(np.isnan(q_ev)) else 0
+            peak_discharge = np.nan
+        else:
+            peak_idx_local = int(np.nanargmax(q_ev))
+            peak_discharge = float(np.nanmax(q_ev))
+        peak_idx = a + peak_idx_local
+
+        start_h, peak_h, end_h = hours[a], hours[peak_idx], hours[b]
+        rise = peak_h - start_h
+
+        # time strictly above threshold, integrating real deltas, capping gaps
+        seg_h = hours[a:b + 1]
+        seg_above = above[a:b + 1]
+        dt = np.diff(seg_h)
+        dt = np.clip(dt, 0, MAX_GAP_HOURS)
+        dur_above = float(np.sum(dt[seg_above[:-1]]))
+
+        # coverage / missing fraction from median interval
+        n_obs = b - a + 1
+        med_dt = float(np.median(np.diff(seg_h))) if n_obs > 1 else np.nan
+        expected = (end_h - start_h) / med_dt + 1 if med_dt and med_dt > 0 else np.nan
+        missing_frac = float(1 - n_obs / expected) if expected and expected > 0 else np.nan
+        missing_frac = min(max(missing_frac, 0.0), 1.0) if not np.isnan(missing_frac) else np.nan
+
+        # QC / censoring flags
+        flags = []
+        if a == 0:
+            flags.append("left_censored")           # already above at record start
+        if b == n - 1:
+            flags.append("right_censored")          # still above at record end
+        if rise == 0:
+            flags.append("zero_rise_time")
+        if np.isnan(peak_discharge):
+            flags.append("no_discharge")
+        big_gap = np.any(np.diff(seg_h) > MAX_GAP_HOURS)
+        if big_gap:
+            flags.append("data_gap")
+        qf = pd.Series(df["q_flag"].values[sl]).astype(str)
+        prov = float(np.mean(qf.str.contains("P|e", case=False, na=False))) if len(qf) else np.nan
+        if prov and prov > 0.5:
+            flags.append("mostly_provisional")
+
+        # severity = peak discharge / rise time (paper). Undefined if rise==0.
+        severity = peak_discharge / rise if rise > 0 else np.nan
+
+        # --- better, monotonic severities: integrate the excess above threshold ---
+        # (run-theory "intensity x duration": rises with both how-high and how-long,
+        #  so a genuine big/long flood always outranks a short flashy blip)
+        q_seg = q[sl].astype(float)
+        h_seg = gh[sl].astype(float)
+        finite_q = q_seg[np.isfinite(q_seg)]
+        q_thr = float(finite_q[0]) if finite_q.size else np.nan     # discharge at onset
+        if np.isfinite(q_thr):
+            ex_q = np.clip(np.nan_to_num(q_seg - q_thr, nan=0.0), 0, None)
+            severity_excess_vol_cfs_hr = float(np.sum(ex_q[:-1] * dt))   # cfs*hr
+        else:
+            severity_excess_vol_cfs_hr = np.nan
+        ex_h = np.clip(np.nan_to_num(h_seg - action_stage, nan=0.0), 0, None)
+        severity_stage_ft_hr = float(np.sum(ex_h[:-1] * dt))            # ft*hr, rating-free
+
+        # --- percentile-gated severity: integrate only the excess above the p-th
+        # percentile discharge. Marginal events that barely clear the percentile
+        # score ~0, so a short blur can no longer outrank a genuine flood. ---
+        if np.isfinite(q_pctl):
+            ex_qp = np.clip(np.nan_to_num(q_seg - q_pctl, nan=0.0), 0, None)
+            severity_pctl_vol_cfs_hr = float(np.sum(ex_qp[:-1] * dt))
+        else:
+            severity_pctl_vol_cfs_hr = np.nan
+        # how extreme this event's peak is vs the gauge's whole record (0-100)
+        peak_pctl = (float((q_finite <= peak_discharge).mean() * 100)
+                     if (q_finite.size and np.isfinite(peak_discharge)) else np.nan)
+
+        start_utc = df["datetime_utc"].iloc[a]
+        peak_utc = df["datetime_utc"].iloc[peak_idx]
+        end_utc = df["datetime_utc"].iloc[b]
+
+        def to_local(ts):
+            try:
+                return ts.tz_convert(tz) if tz else ts
+            except Exception:
+                return ts
+
+        events.append({
+            "event_id": k,
+            "event_start_time": to_local(start_utc),
+            "peak_time": to_local(peak_utc),
+            "event_end_time": to_local(end_utc),
+            "event_start_time_utc": start_utc,
+            "peak_time_utc": peak_utc,
+            "event_end_time_utc": end_utc,
+            "peak_gage_height_ft": float(np.nanmax(gh[sl])),
+            "peak_discharge_cfs": peak_discharge,
+            "rise_time_hours": round(rise, 3),
+            "duration_above_threshold_hours": round(dur_above, 3),
+            "flood_severity": severity,
+            "severity_excess_vol_cfs_hr": severity_excess_vol_cfs_hr,
+            "severity_stage_ft_hr": round(severity_stage_ft_hr, 2),
+            "severity_pctl_vol_cfs_hr": severity_pctl_vol_cfs_hr,
+            "peak_pctl": None if peak_pctl is None or np.isnan(peak_pctl) else round(peak_pctl, 2),
+            "number_of_observations": int(n_obs),
+            "missing_data_fraction": None if np.isnan(missing_frac) else round(missing_frac, 4),
+            "provisional_fraction": None if np.isnan(prov) else round(prov, 4),
+            "quality_flag": ";".join(flags) if flags else "ok",
+            "year": int(pd.Timestamp(start_utc).year),
+        })
+    return events
+
+
+# ------------------------------------------------------------
+# 4. drainage area (for the recommended comparable metric)
+# ------------------------------------------------------------
+def drainage_area(site):
+    try:
+        m, _ = waterdata.get_monitoring_locations(monitoring_location_id=[f"USGS-{site}"])
+        da = pd.to_numeric(m.get("drainage_area"), errors="coerce")
+        return float(da.iloc[0]) if len(da) and pd.notna(da.iloc[0]) else np.nan
+    except Exception:
+        return np.nan
+
+
+def screen_sites(site_ids):
+    """Keep only sites with INSTANTANEOUS (uv) discharge AND gage height, so we don't
+    download years of data just to find a gauge is stage-only. Retries transient
+    failures; if the catalog is entirely unavailable, processes all sites."""
+    import time
+    keep, got_any = [], False
+    CHUNK = 25
+    for i in range(0, len(site_ids), CHUNK):
+        chunk = site_ids[i:i + CHUNK]
+        cat = None
+        for attempt in range(1, 5):
+            try:
+                cat, _ = nwis.get_info(sites=chunk, seriesCatalogOutput=True)
+                break
+            except Exception as e:
+                log.warning("catalog chunk %d attempt %d failed (%s)",
+                            i // CHUNK + 1, attempt, str(e)[:80])
+                time.sleep(5 * attempt)
+        if cat is None or "parm_cd" not in cat.columns or "data_type_cd" not in cat.columns:
+            continue
+        got_any = True
+        uv = cat[cat["data_type_cd"].astype(str).str.lower() == "uv"]
+        params = uv.groupby("site_no")["parm_cd"].apply(lambda s: set(s.astype(str)))
+        for s in chunk:
+            if {DISCHARGE, GAGE_HT} <= params.get(s, set()):
+                keep.append(s)
+    if not got_any:
+        log.warning("series catalog unavailable; processing all usable sites")
+        return site_ids
+    return keep
+
+
+# ------------------------------------------------------------
+# 5. main
+# ------------------------------------------------------------
+def main():
+    usable = load_nwps(STATE)
+
+    ids = list(usable["usgs_site_id"])
+    good = screen_sites(ids)
+    sites = usable[usable["usgs_site_id"].isin(good)].reset_index(drop=True)
+    log.info("%d of %d action-stage sites also have instantaneous discharge + gage height",
+             len(sites), len(ids))
+    if sites.empty:
+        log.warning("No LA sites have uv discharge + uv gage height + a valid action stage.")
+        return
+
+    if TEST_MODE:
+        sites = sites.head(TEST_N)
+        log.info("TEST_MODE: %d site(s)", len(sites))
+
+    all_events, skipped = [], []
+    for _, s in sites.iterrows():
+        site = s["usgs_site_id"]
+        log.info("=== %s (%s) action_stage=%.2f ft ===",
+                 site, s["nws_location_id"], s["action_stage_ft"])
+        try:
+            df = fetch_iv(site)
+        except Exception as e:
+            log.error("fetch failed for %s: %s", site, e)
+            skipped.append((site, "fetch_error"))
+            continue
+        if df is None or df.empty:
+            log.warning("no instantaneous gage-height data for %s", site)
+            skipped.append((site, "no_iv_data"))
+            continue
+        if df["discharge_cfs"].notna().sum() == 0:
+            log.warning("gage height but NO discharge for %s -> skip", site)
+            skipped.append((site, "no_discharge"))
+            continue
+        log.info("  %s: %d obs, %s .. %s", site, len(df),
+                 df["datetime_utc"].min().date(), df["datetime_utc"].max().date())
+
+        evs = detect_events(df, s["action_stage_ft"], s.get("timezone"))
+        if not evs:
+            log.info("  no threshold exceedances")
+            continue
+        da = drainage_area(site)
+        for ev in evs:
+            ev.update({
+                "usgs_site_id": site,
+                "nws_location_id": s["nws_location_id"],
+                "station_name": s["station_name"],
+                "latitude": s["latitude"], "longitude": s["longitude"],
+                "action_stage_ft": s["action_stage_ft"],
+                "drainage_area_sqmi": da,
+                "flood_severity_norm": (ev["flood_severity"] / da
+                                        if (da and da > 0 and pd.notna(ev["flood_severity"]))
+                                        else np.nan),
+                "severity_excess_depth_in": (
+                    ev["severity_excess_vol_cfs_hr"] * 43200.0 / (da * 27878400.0)
+                    if (da and da > 0 and pd.notna(ev.get("severity_excess_vol_cfs_hr")))
+                    else np.nan),
+                "severity_pctl_depth_in": (
+                    ev["severity_pctl_vol_cfs_hr"] * 43200.0 / (da * 27878400.0)
+                    if (da and da > 0 and pd.notna(ev.get("severity_pctl_vol_cfs_hr")))
+                    else np.nan),
+            })
+        all_events.extend(evs)
+        log.info("  %d event(s)", len(evs))
+
+    if not all_events:
+        log.warning("No events detected.")
+        return
+
+    cols = ["usgs_site_id", "nws_location_id", "station_name", "latitude", "longitude",
+            "event_id", "event_start_time", "peak_time", "event_end_time",
+            "event_start_time_utc", "peak_time_utc", "event_end_time_utc",
+            "action_stage_ft", "peak_gage_height_ft", "peak_discharge_cfs",
+            "rise_time_hours", "duration_above_threshold_hours",
+            "flood_severity", "flood_severity_norm",
+            "severity_excess_vol_cfs_hr", "severity_excess_depth_in", "severity_stage_ft_hr",
+            "severity_pctl_vol_cfs_hr", "severity_pctl_depth_in", "peak_pctl",
+            "drainage_area_sqmi",
+            "number_of_observations", "missing_data_fraction", "provisional_fraction",
+            "quality_flag", "year"]
+    out = pd.DataFrame(all_events)
+    out = out[out["year"] <= END_YEAR]
+    out = out[[c for c in cols if c in out.columns]].sort_values(
+        ["usgs_site_id", "event_start_time_utc"])
+
+    out_csv = OUT_DIR / ("flood_events_TEST.csv" if TEST_MODE else "flood_events_louisiana.csv")
+    out.to_csv(out_csv, index=False)
+    pd.DataFrame(skipped, columns=["usgs_site_id", "reason"]).to_csv(
+        OUT_DIR / "skipped_sites_data.csv", index=False)
+
+    log.info("=" * 56)
+    log.info("%d events across %d sites -> %s",
+             len(out), out["usgs_site_id"].nunique(), out_csv)
+    log.info("flagged: %d ok, %d with quality flags",
+             (out["quality_flag"] == "ok").sum(), (out["quality_flag"] != "ok").sum())
+    print(out.head(10).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

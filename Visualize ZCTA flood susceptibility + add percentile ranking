@@ -1,0 +1,86 @@
+"""
+Visualize ZCTA flood susceptibility + add percentile ranking / classes.
+=======================================================================
+Reads the susceptibility CSV, joins ZCTA geometries, adds a percentile rank and
+5 quantile hazard classes, saves a choropleth PNG and a classified CSV.
+Also maps the yearly output as a small-multiple grid if present.
+
+    pip install geopandas matplotlib mapclassify pandas
+"""
+
+from pathlib import Path
+import matplotlib
+matplotlib.use("Agg")                       # no display on HPC
+import matplotlib.pyplot as plt
+import pandas as pd
+import geopandas as gpd
+
+SHARE = Path("/icebox/data/shares/mh1/fgorginpaveh/Tuft/Climate Data")
+ZCTA_SHP = SHARE / "US Zipcode Shapefile" / "tl_2022_us_zcta520.shp"
+DIR = SHARE / "Flood_Susceptibility_ML_Louisiana"
+CLIM_CSV = DIR / "zcta_flood_susceptibility.csv"
+YEAR_CSV = DIR / "zcta_flood_susceptibility_by_year.csv"
+LA_BBOX = (-94.2, 28.8, -88.7, 33.1)
+
+
+def load_geo():
+    zc = gpd.read_file(ZCTA_SHP, bbox=LA_BBOX)
+    zcol = "ZCTA5CE20" if "ZCTA5CE20" in zc.columns else "GEOID20"
+    return zc[[zcol, "geometry"]].rename(columns={zcol: "zip"}).astype({"zip": str})
+
+
+def main():
+    zc = load_geo()
+    df = pd.read_csv(CLIM_CSV, dtype={"zip": str})
+
+    # percentile rank + 5 quantile classes
+    df["susceptibility_pctl"] = (df["susceptibility"].rank(pct=True) * 100).round(1)
+    df["hazard_class"] = pd.qcut(df["susceptibility"].rank(method="first"), 5,
+                                 labels=["Very Low", "Low", "Moderate", "High", "Very High"])
+    df.to_csv(DIR / "zcta_flood_susceptibility_classified.csv", index=False)
+
+    g = zc.merge(df, on="zip", how="left")
+
+    # --- choropleth of susceptibility ---
+    fig, ax = plt.subplots(figsize=(9, 9))
+    g.plot(column="susceptibility", cmap="YlOrRd", legend=True, ax=ax,
+           edgecolor="grey", linewidth=0.1, missing_kwds={"color": "lightgrey"})
+    ax.set_title("ZCTA flood susceptibility (climatological)", fontsize=13)
+    ax.axis("off")
+    fig.savefig(DIR / "map_susceptibility.png", dpi=150, bbox_inches="tight")
+    print(f"-> {DIR/'map_susceptibility.png'}")
+
+    # --- choropleth of quantile classes ---
+    fig, ax = plt.subplots(figsize=(9, 9))
+    g.plot(column="hazard_class", categorical=True, legend=True, cmap="YlOrRd", ax=ax,
+           edgecolor="grey", linewidth=0.1, missing_kwds={"color": "lightgrey"})
+    ax.set_title("ZCTA flood-hazard class (quintiles)", fontsize=13)
+    ax.axis("off")
+    fig.savefig(DIR / "map_susceptibility_classes.png", dpi=150, bbox_inches="tight")
+    print(f"-> {DIR/'map_susceptibility_classes.png'}")
+
+    # --- yearly small-multiples (optional) ---
+    if YEAR_CSV.exists():
+        ydf = pd.read_csv(YEAR_CSV, dtype={"zip": str})
+        years = sorted(ydf["year"].unique())
+        years = years[-9:] if len(years) > 9 else years         # last up to 9 years
+        ncol = 3
+        nrow = -(-len(years) // ncol)
+        fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 4 * nrow))
+        vmax = ydf["susceptibility"].quantile(0.98)
+        for ax, yr in zip(axes.ravel(), years):
+            gy = zc.merge(ydf[ydf["year"] == yr], on="zip", how="left")
+            gy.plot(column="susceptibility", cmap="YlOrRd", ax=ax, vmin=0, vmax=vmax,
+                    edgecolor="none", missing_kwds={"color": "lightgrey"})
+            ax.set_title(str(yr)); ax.axis("off")
+        for ax in axes.ravel()[len(years):]:
+            ax.axis("off")
+        fig.suptitle("ZCTA flood susceptibility by year (rainfall-driven)", fontsize=13)
+        fig.savefig(DIR / "map_susceptibility_by_year.png", dpi=140, bbox_inches="tight")
+        print(f"-> {DIR/'map_susceptibility_by_year.png'}")
+
+    print("\nSaved classified CSV with susceptibility_pctl + hazard_class.")
+
+
+if __name__ == "__main__":
+    main()

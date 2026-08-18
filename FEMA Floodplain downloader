@@ -1,0 +1,153 @@
+"""
+Robust FEMA NFHL floodplain downloader (beats the connection resets)
+====================================================================
+Downloads the FEMA 100-yr Special Flood Hazard Areas for Louisiana and saves
+la_floodplain.gpkg, which flood_hazard_fema_target.py then uses.
+
+Why this works where the earlier attempts failed:
+  * a real browser User-Agent (FEMA resets bare python-requests)
+  * automatic retries with exponential backoff on connection resets / 5xx
+  * small geographic TILES, each cached to disk -> fully RESUMABLE
+  * pagination within each tile (handles dense coastal areas)
+  * de-duplication of polygons that span tile edges
+
+After it finishes:  python flood_hazard_fema_target.py
+
+    pip install requests geopandas shapely pandas
+"""
+
+import io
+import time
+from pathlib import Path
+
+import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:
+    from requests.packages.urllib3.util.retry import Retry
+import geopandas as gpd
+import pandas as pd
+
+SHARE = Path("/icebox/data/shares/mh1/fgorginpaveh/Tuft/Climate Data")
+OUT = SHARE / "Predictors_Louisiana"
+# /icebox can't do SQLite file locking (breaks .gpkg writes), so cache tiles and
+# build the file on LOCAL disk, then copy the finished file to the share.
+SCRATCH = Path("/bighome/fgorginpaveh/fema_scratch")
+TILE_CACHE = SCRATCH / "_fema_tiles"
+DST_LOCAL = SCRATCH / "la_floodplain.gpkg"
+DST = OUT / "la_floodplain.gpkg"
+LA_BBOX = (-94.2, 28.8, -88.7, 33.1)          # minx, miny, maxx, maxy
+TILE = 0.5                                     # degrees
+LAYER = "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query"
+
+
+def make_session():
+    s = requests.Session()
+    retry = Retry(total=6, connect=6, read=6, backoff_factor=1.5,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=frozenset(["GET"]))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+        "Accept": "application/json",
+    })
+    return s
+
+
+def preflight(s):
+    try:
+        # a real HTTP response (even 404) proves the host is reachable and not blocked
+        r = s.get(LAYER, params={"where": "1=1", "returnCountOnly": "true", "f": "json"},
+                  timeout=60)
+        print(f"[preflight] FEMA reachable (HTTP {r.status_code}) -> proceeding")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"[preflight] FEMA NOT reachable from this machine: {str(e)[:120]}")
+        print("            -> your cluster is blocking hazards.fema.gov; use the manual "
+              "GDB from https://msc.fema.gov/portal/advanceSearch")
+        return False
+
+
+def fetch_tile(s, x0, y0, x1, y1):
+    """All SFHA polygons in one tile, paginating within it."""
+    frames, offset = [], 0
+    while True:
+        params = {"where": "SFHA_TF='T'",
+                  "geometry": f"{x0},{y0},{x1},{y1}",
+                  "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
+                  "spatialRel": "esriSpatialRelIntersects", "outFields": "FLD_ZONE",
+                  "returnGeometry": "true", "f": "geojson",
+                  "resultRecordCount": "2000", "resultOffset": offset}
+        r = s.get(LAYER, params=params, timeout=300)
+        r.raise_for_status()
+        if not r.text.strip().startswith("{"):
+            raise RuntimeError(f"non-JSON: {r.text[:100]}")
+        g = gpd.read_file(io.StringIO(r.text))
+        if len(g) == 0:
+            break
+        frames.append(g)
+        if len(g) < 2000:
+            break
+        offset += 2000
+        time.sleep(0.5)
+    if frames:
+        return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=4326)
+    return None
+
+
+def main():
+    import numpy as np
+    OUT.mkdir(parents=True, exist_ok=True)
+    TILE_CACHE.mkdir(parents=True, exist_ok=True)
+    s = make_session()
+    if not preflight(s):
+        return
+
+    minx, miny, maxx, maxy = LA_BBOX
+    xs = np.arange(minx, maxx, TILE)
+    ys = np.arange(miny, maxy, TILE)
+    total = len(xs) * len(ys)
+    done = 0
+    for x0 in xs:
+        for y0 in ys:
+            done += 1
+            x1, y1 = min(x0 + TILE, maxx), min(y0 + TILE, maxy)
+            cache = TILE_CACHE / f"tile_{x0:.2f}_{y0:.2f}.geojson"
+            if cache.exists():
+                continue
+            try:
+                g = fetch_tile(s, x0, y0, x1, y1)
+                if g is not None and len(g):
+                    g.to_file(cache, driver="GeoJSON")
+                    print(f"[{done}/{total}] tile {x0:.2f},{y0:.2f}: {len(g)} polygons", flush=True)
+                else:
+                    (TILE_CACHE / f"tile_{x0:.2f}_{y0:.2f}.empty").write_text("")
+                    print(f"[{done}/{total}] tile {x0:.2f},{y0:.2f}: empty", flush=True)
+            except Exception as e:
+                print(f"[{done}/{total}] tile {x0:.2f},{y0:.2f} FAILED: {str(e)[:90]} "
+                      "(will retry on rerun)", flush=True)
+
+    # combine all cached tiles
+    tiles = list(TILE_CACHE.glob("tile_*.geojson"))
+    if not tiles:
+        print("[combine] no tiles downloaded; nothing to save")
+        return
+    parts = [gpd.read_file(t) for t in tiles]
+    allpoly = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=4326)
+    # drop polygons duplicated across tile edges
+    allpoly["_wkb"] = allpoly.geometry.to_wkb()
+    allpoly = allpoly.drop_duplicates("_wkb").drop(columns="_wkb")
+
+    # write on LOCAL disk (SQLite/gpkg can't be created on /icebox), then copy to share
+    import shutil
+    DST_LOCAL.unlink(missing_ok=True)
+    allpoly.to_file(DST_LOCAL)
+    shutil.copy(DST_LOCAL, DST)
+    print(f"\n[done] saved {len(allpoly)} SFHA polygons -> {DST}")
+    print("Now run:  python flood_hazard_fema_target.py")
+
+
+if __name__ == "__main__":
+    main()
